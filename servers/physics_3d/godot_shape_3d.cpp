@@ -851,8 +851,14 @@ void GodotConvexPolygonShape3D::project_range(const Vector3 &p_normal, const Tra
 }
 
 Vector3 GodotConvexPolygonShape3D::get_support(const Vector3 &p_normal) const {
-	// Skip if there are no vertices in the mesh
-	if (mesh.vertices.size() == 0) {
+	if (!mutex.try_lock()) {
+		return Vector3();
+	}
+
+	// Skip if there are no vertices in the mesh or is not yet initialized
+	if (mesh.vertices.size() == 0 ||
+			extreme_vertices.size() == 0 || vertex_neighbors.size() == 0) {
+		mutex.unlock();
 		return Vector3();
 	}
 
@@ -874,6 +880,7 @@ Vector3 GodotConvexPolygonShape3D::get_support(const Vector3 &p_normal) const {
 
 	// If we checked all vertices in the mesh then we're done.
 	if (extreme_vertices.size() == mesh.vertices.size()) {
+		mutex.unlock();
 		return vertices_array[best_vertex];
 	}
 
@@ -896,6 +903,7 @@ Vector3 GodotConvexPolygonShape3D::get_support(const Vector3 &p_normal) const {
 
 		// No better vertex found, we have the best
 		if (next_vertex == -1) {
+			mutex.unlock();
 			return vertices_array[best_vertex];
 		}
 
@@ -903,6 +911,7 @@ Vector3 GodotConvexPolygonShape3D::get_support(const Vector3 &p_normal) const {
 		last_vertex = best_vertex;
 		best_vertex = next_vertex;
 	}
+	mutex.unlock();
 }
 
 void GodotConvexPolygonShape3D::get_supports(const Vector3 &p_normal, int p_max, Vector3 *r_supports, int &r_amount, FeatureType &r_type) const {
@@ -1099,8 +1108,7 @@ void GodotConvexPolygonShape3D::_setup(const Vector<Vector3> &p_vertices) {
 	if (err != OK) {
 		ERR_PRINT("Failed to build convex hull");
 	}
-	extreme_vertices.resize(0);
-	vertex_neighbors.resize(0);
+	mutex.lock();
 
 	AABB _aabb;
 
@@ -1149,6 +1157,7 @@ void GodotConvexPolygonShape3D::_setup(const Vector<Vector3> &p_vertices) {
 			vertex_neighbors[edge.vertex_b].push_back(edge.vertex_a);
 		}
 	}
+	mutex.unlock();
 }
 
 void GodotConvexPolygonShape3D::set_data(const Variant &p_data) {

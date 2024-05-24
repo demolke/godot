@@ -276,6 +276,7 @@ public:
 };
 
 struct GodotConvexPolygonShape3D : public GodotShape3D {
+	Mutex mutex;
 	Geometry3D::MeshData mesh;
 	LocalVector<int> extreme_vertices;
 	LocalVector<LocalVector<int>> vertex_neighbors;
