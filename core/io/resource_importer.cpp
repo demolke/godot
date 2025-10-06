@@ -66,8 +66,6 @@ Error ResourceFormatImporter::_get_path_and_type(const String &p_path, PathAndTy
 	String error_text;
 	bool path_found = false; // First match must have priority.
 
-	String decomp_path;
-	bool decomp_path_found = false;
 	while (true) {
 		assign = Variant();
 		next_tag.fields.clear();
@@ -75,11 +73,6 @@ Error ResourceFormatImporter::_get_path_and_type(const String &p_path, PathAndTy
 
 		err = VariantParser::parse_tag_assign_eof(&stream, lines, error_text, next_tag, assign, value, nullptr, true);
 		if (err == ERR_FILE_EOF) {
-			if (p_load && !path_found && decomp_path_found) {
-				print_verbose(vformat("No natively supported texture format found for %s, using decompressable format %s.", p_path, decomp_path));
-				r_path_and_type.path = decomp_path;
-			}
-
 			return OK;
 		} else if (err != OK) {
 			ERR_PRINT(vformat("ResourceFormatImporter::load - %s.import:%d error: %s.", p_path, lines, error_text));
@@ -92,11 +85,7 @@ Error ResourceFormatImporter::_get_path_and_type(const String &p_path, PathAndTy
 				if (OS::get_singleton()->has_feature(feature)) {
 					r_path_and_type.path = value;
 					path_found = true; // First match must have priority.
-				} else if (p_load && Image::can_decompress(feature) && !decomp_path_found) { // When loading, check for decompressable formats and use first one found if nothing else is supported.
-					decomp_path = value;
-					decomp_path_found = true; // First match must have priority.
 				}
-
 			} else if (!path_found && assign == "path") {
 				r_path_and_type.path = value;
 				path_found = true; // First match must have priority.
@@ -121,11 +110,6 @@ Error ResourceFormatImporter::_get_path_and_type(const String &p_path, PathAndTy
 		}
 	}
 
-	if (p_load && !path_found && decomp_path_found) {
-		print_verbose(vformat("No natively supported texture format found for %s, using decompressable format %s.", p_path, decomp_path));
-		r_path_and_type.path = decomp_path;
-		return OK;
-	}
 
 #ifdef TOOLS_ENABLED
 	if (r_path_and_type.metadata && !r_path_and_type.path.is_empty()) {
@@ -155,48 +139,116 @@ Error ResourceFormatImporter::_get_path_and_type(const String &p_path, PathAndTy
 }
 
 Ref<Resource> ResourceFormatImporter::load(const String &p_path, const String &p_original_path, Error *r_error, bool p_use_sub_threads, float *r_progress, CacheMode p_cache_mode) {
+	// Always use load_internal to ensure lazy loading is respected
+	// The startup callback is only used for reimport/retry on missing resources
+	Ref<Resource> res = load_internal(p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode, false);
+	
 #ifdef TOOLS_ENABLED
-	// When loading a resource on startup, we use the load_on_startup callback,
-	// which executes the loading in the EditorFileSystem. It can reimport
-	// the resource and retry the load, allowing the resource to be loaded
-	// even if it is not yet imported.
-	if (ResourceImporter::load_on_startup != nullptr) {
+	// If resource load failed and we have a startup callback, try reimport
+	if (res.is_null() && ResourceImporter::load_on_startup != nullptr) {
+		// Try reimport through EditorFileSystem
 		return ResourceImporter::load_on_startup(this, p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode);
 	}
 #endif
 
-	return load_internal(p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode, false);
+	return res;
 }
 
 Ref<Resource> ResourceFormatImporter::load_internal(const String &p_path, Error *r_error, bool p_use_sub_threads, float *r_progress, CacheMode p_cache_mode, bool p_silence_errors) {
 	PathAndType pat;
 	Error err = _get_path_and_type(p_path, pat, true);
 
+	// Import file is missing or corrupt
 	if (err != OK) {
+		if (p_silence_errors) {
+			return Ref<Resource>();
+		}
 		if (r_error) {
 			*r_error = err;
 		}
-
 		return Ref<Resource>();
 	}
 
-	if (p_silence_errors) {
-		// Note: Some importers do not create files in the .godot folder, so we need to check if the path is empty.
-		if (!pat.path.is_empty() && !FileAccess::exists(pat.path)) {
+	// First try to load the already imported resource if it exists
+	if (!pat.path.is_empty() && FileAccess::exists(pat.path)) {
+		bool needs_reimport = false;
+		
+		if (lazy_import_mode) {
+			// In lazy mode, first do a quick check
+			if (_test_quick_reimport(p_path, pat)) {
+				needs_reimport = true;
+			} else {
+				// Do full validation if quick check passes
+				pat.import_state = _validate_import_state(p_path, pat);
+				needs_reimport = (pat.import_state != ResourceImporter::IMPORT_STATE_VALID);
+			}
+		}
+
+		if (!needs_reimport) {
+			Ref<Resource> res = ResourceLoader::_load(pat.path, p_path, pat.type, p_cache_mode, r_error, p_use_sub_threads, r_progress);
+			if (res.is_valid()) {
+				return res;
+			}
+		}
+
+		// If load failed and we're silencing errors, return null without trying import
+		if (p_silence_errors) {
 			return Ref<Resource>();
 		}
 	}
 
-	Ref<Resource> res = ResourceLoader::_load(pat.path, p_path, pat.type, p_cache_mode, r_error, p_use_sub_threads, r_progress);
-
-#ifdef TOOLS_ENABLED
-	if (res.is_valid()) {
-		res->set_import_last_modified_time(res->get_last_modified_time()); //pass this, if used
-		res->set_import_path(pat.path);
+	// Don't try to import if we're silencing errors
+	if (p_silence_errors) {
+		if (r_error) {
+			*r_error = ERR_FILE_NOT_FOUND;
+		}
+		return Ref<Resource>();
 	}
-#endif
 
-	return res;
+	// Resource needs importing and we're actually trying to load it (not just scanning)
+	if (!pat.importer.is_empty()) {
+		Ref<ResourceImporter> importer = get_importer_by_name(pat.importer);
+		if (importer.is_valid()) {
+			String save_path = pat.path;
+			if (save_path.is_empty()) {
+				save_path = ProjectSettings::get_singleton()->get_imported_files_path().path_join(p_path.get_file() + "-" + p_path.md5_text() + "." + importer->get_save_extension());
+			}
+			List<ResourceImporter::ImportOption> options;
+			importer->get_import_options(p_path, &options, 0);
+			HashMap<StringName, Variant> opts;
+			for (const auto &opt : options) {
+				opts[opt.option.name] = opt.default_value;
+			}
+			// Only import when actually loading the resource
+			Error import_err = importer->import(ResourceUID::INVALID_ID, p_path, save_path, opts, nullptr, nullptr, nullptr);
+			if (import_err == OK) {
+				err = _get_path_and_type(p_path, pat, true);
+				if (err == OK && FileAccess::exists(pat.path)) {
+					Ref<Resource> res = ResourceLoader::_load(pat.path, p_path, pat.type, p_cache_mode, r_error, p_use_sub_threads, r_progress);
+					if (res.is_valid()) {
+#ifdef TOOLS_ENABLED
+						res->set_import_last_modified_time(res->get_last_modified_time()); //pass this, if used
+						res->set_import_path(pat.path);
+#endif
+						return res;
+					}
+				}
+			}
+			// Import failed
+			if (r_error) {
+				*r_error = import_err;
+			}
+			return Ref<Resource>();
+		}
+	}
+
+	// If we get here, either:
+	// 1. There's no importer
+	// 2. Import failed
+	if (r_error) {
+		*r_error = ERR_FILE_CANT_OPEN;
+	}
+	return Ref<Resource>();
 }
 
 void ResourceFormatImporter::get_recognized_extensions(List<String> *p_extensions) const {
