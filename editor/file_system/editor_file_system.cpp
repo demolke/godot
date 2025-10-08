@@ -1,9 +1,3 @@
-// Registers the lazy import project setting and updates the static flag.
-void EditorFileSystem::register_lazy_import_setting() {
-       // Add a new project setting for lazy import mode
-       GLOBAL_DEF("editor/import/use_lazy_import", false);
-       ResourceImporter::lazy_import_mode = GLOBAL_GET("editor/import/use_lazy_import");
-}
 /**************************************************************************/
 /*  editor_file_system.cpp                                                */
 /**************************************************************************/
@@ -1235,87 +1229,72 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 		FileCache *fc = file_cache.getptr(path);
 		uint64_t mt = FileAccess::get_modified_time(path);
 
-		   if (_can_import_file(scan_file)) {
-			   // In lazy import mode, skip all background and scan-time imports.
-			   if (ResourceImporter::lazy_import_mode) {
-				   // Only record metadata, do not trigger any import or reimport actions.
-				   if (fc) {
-					   fi->type = fc->type;
-					   fi->resource_script_class = fc->resource_script_class;
-					   fi->uid = fc->uid;
-					   fi->deps = fc->deps;
-					   fi->modified_time = mt;
-					   fi->import_modified_time = FileAccess::get_modified_time(path + ".import");
-					   fi->import_md5 = fc->import_md5;
-					   fi->import_dest_paths = fc->import_dest_paths;
-					   fi->import_valid = fc->import_valid;
-					   fi->import_group_file = fc->import_group_file;
-					   fi->class_info = fc->class_info;
-				   } else {
-					   ResourceFormatImporter::get_singleton()->get_resource_import_info(path, fi->type, fi->uid, fi->import_group_file);
-					   fi->class_info = _get_global_script_class(fi->type, path);
-					   fi->modified_time = 0;
-					   fi->import_modified_time = 0;
-					   fi->import_md5 = FileAccess::get_md5(path + ".import");
-					   fi->import_dest_paths = Vector<String>();
-					   fi->import_valid = (fi->type == "TextFile" || fi->type == "OtherFile") ? true : ResourceLoader::is_import_valid(path);
-				   }
-				   // Do not queue any import/reimport actions in lazy mode.
-			   } else {
-				   // ...existing code...
-				   if (fc) {
-					   fi->type = fc->type;
-					   fi->resource_script_class = fc->resource_script_class;
-					   fi->uid = fc->uid;
-					   fi->deps = fc->deps;
-					   fi->modified_time = mt;
-					   fi->import_modified_time = import_mt;
-					   fi->import_md5 = fc->import_md5;
-					   fi->import_dest_paths = fc->import_dest_paths;
-					   fi->import_valid = fc->import_valid;
-					   fi->import_group_file = fc->import_group_file;
-					   fi->class_info = fc->class_info;
+		if (_can_import_file(scan_file)) {
+			//is imported
+			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
 
-					   if (fc->import_md5.is_empty()) {
-						   fi->import_md5 = FileAccess::get_md5(path + ".import");
-						   fi->import_dest_paths = _get_import_dest_paths(path);
-					   }
+			if (fc) {
+				fi->type = fc->type;
+				fi->resource_script_class = fc->resource_script_class;
+				fi->uid = fc->uid;
+				fi->deps = fc->deps;
+				fi->modified_time = mt;
+				fi->import_modified_time = import_mt;
+				fi->import_md5 = fc->import_md5;
+				fi->import_dest_paths = fc->import_dest_paths;
+				fi->import_valid = fc->import_valid;
+				fi->import_group_file = fc->import_group_file;
+				fi->class_info = fc->class_info;
 
-					   if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths) ||
-							   (revalidate_import_files && !ResourceFormatImporter::get_singleton()->are_import_settings_valid(path))) {
-						   ItemAction ia;
-						   ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
-						   ia.dir = p_dir;
-						   ia.file = fi->file;
-						   scan_actions.push_back(ia);
-					   }
+				// Ensures backward compatibility when the project is loaded for the first time with the added import_md5
+				// and import_dest_paths properties in the file cache.
+				if (fc->import_md5.is_empty()) {
+					fi->import_md5 = FileAccess::get_md5(path + ".import");
+					fi->import_dest_paths = _get_import_dest_paths(path);
+				}
 
-					   if (fc->type.is_empty()) {
-						   fi->type = ResourceLoader::get_resource_type(path);
-						   fi->resource_script_class = ResourceLoader::get_resource_script_class(path);
-						   fi->import_group_file = ResourceLoader::get_import_group_file(path);
-					   }
+				// The method _is_test_for_reimport_needed checks if the files were modified and ensures that
+				// all the destination files still exist without reading the .import file.
+				// If something is different, we will queue a test for reimportation that will check
+				// the md5 of all files and import settings and, if necessary, execute a reimportation.
+				if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths) ||
+						(revalidate_import_files && !ResourceFormatImporter::get_singleton()->are_import_settings_valid(path))) {
+					ItemAction ia;
+					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+					ia.dir = p_dir;
+					ia.file = fi->file;
+					scan_actions.push_back(ia);
+				}
 
-					   if (fc->uid == ResourceUID::INVALID_ID) {
-						   fi->uid = ResourceLoader::get_resource_uid(path);
-					   }
+				if (fc->type.is_empty()) {
+					fi->type = ResourceLoader::get_resource_type(path);
+					fi->resource_script_class = ResourceLoader::get_resource_script_class(path);
+					fi->import_group_file = ResourceLoader::get_import_group_file(path);
+					//there is also the chance that file type changed due to reimport, must probably check this somehow here (or kind of note it for next time in another file?)
+					//note: I think this should not happen any longer..
+				}
 
-				   } else {
-					   ResourceFormatImporter::get_singleton()->get_resource_import_info(path, fi->type, fi->uid, fi->import_group_file);
-					   fi->class_info = _get_global_script_class(fi->type, path);
-					   fi->modified_time = 0;
-					   fi->import_modified_time = 0;
-					   fi->import_md5 = FileAccess::get_md5(path + ".import");
-					   fi->import_dest_paths = Vector<String>();
-					   fi->import_valid = (fi->type == "TextFile" || fi->type == "OtherFile") ? true : ResourceLoader::is_import_valid(path);
+				if (fc->uid == ResourceUID::INVALID_ID) {
+					// imported files should always have a UID, so attempt to fetch it.
+					fi->uid = ResourceLoader::get_resource_uid(path);
+				}
 
-					   ItemAction ia;
-					   ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
-					   ia.dir = p_dir;
-					   ia.file = fi->file;
-					   scan_actions.push_back(ia);
-				   }
-			   }
+			} else {
+				// Using get_resource_import_info() to prevent calling 3 times ResourceFormatImporter::_get_path_and_type.
+				ResourceFormatImporter::get_singleton()->get_resource_import_info(path, fi->type, fi->uid, fi->import_group_file);
+				fi->class_info = _get_global_script_class(fi->type, path);
+				fi->modified_time = 0;
+				fi->import_modified_time = 0;
+				fi->import_md5 = FileAccess::get_md5(path + ".import");
+				fi->import_dest_paths = Vector<String>();
+				fi->import_valid = (fi->type == "TextFile" || fi->type == "OtherFile") ? true : ResourceLoader::is_import_valid(path);
+
+				ItemAction ia;
+				ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+				ia.dir = p_dir;
+				ia.file = fi->file;
+				scan_actions.push_back(ia);
+			}
 		} else {
 			if (fc && fc->modification_time == mt) {
 				//not imported, so just update type if changed

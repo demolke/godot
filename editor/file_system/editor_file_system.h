@@ -83,9 +83,6 @@ class EditorFileSystemDirectory : public Object {
 	friend class EditorFileSystem;
 
 public:
-	void register_lazy_import_setting();
-	// Registers the lazy import project setting and updates the static flag.
-	static void register_lazy_import_setting();
 	String get_name();
 	String get_path() const;
 
