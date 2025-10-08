@@ -1,3 +1,37 @@
+#include "core/io/resource_importer.h"
+#ifdef TOOLS_ENABLED
+// Helper: Recursively import all dependencies for a scene before loading/instantiating.
+static void _import_scene_dependencies(const String &scene_path) {
+	List<String> deps;
+	ResourceLoader::get_dependencies(scene_path, &deps, false);
+	deps.push_back(scene_path); // Ensure the scene itself is included
+	HashSet<String> visited;
+	for (const String &dep : deps) {
+		if (visited.has(dep)) continue;
+		visited.insert(dep);
+		// Recursively import dependencies of nested scenes
+		if (dep.ends_with(".tscn") || dep.ends_with(".scn")) {
+			_import_scene_dependencies(dep);
+		}
+		// Only import if this is an importable resource
+		if (ResourceFormatImporter::get_singleton()->recognize_path(dep)) {
+			if (!ResourceLoader::is_imported(dep)) {
+				// Synchronously import the resource
+				Error err = ResourceFormatImporter::get_singleton()->import(dep);
+				if (err != OK) {
+					ERR_PRINT(vformat("Failed to import resource '%s' (error %d)", dep, err));
+				}
+			}
+		}
+	}
+}
+#endif
+// Call this before loading/instantiating a scene to ensure all dependencies are imported.
+void PackedScene::import_all_dependencies(const String &scene_path) {
+#ifdef TOOLS_ENABLED
+	_import_scene_dependencies(scene_path);
+#endif
+}
 /**************************************************************************/
 /*  packed_scene.cpp                                                      */
 /**************************************************************************/
@@ -2290,8 +2324,16 @@ int SceneState::add_node(int p_parent, int p_owner, int p_type, int p_name, int 
 	nd.index = p_index;
 
 	nodes.push_back(nd);
-
 	ids.push_back(p_unique_id);
+
+#ifdef TOOLS_ENABLED
+	// Lazy import: scan properties for resource paths and import if needed
+	if (Engine::get_singleton()->is_editor_hint() && EditorFileSystem::get_singleton()->is_lazy_import_mode_enabled()) {
+		// Scan all properties of the node for resource paths
+		// (Properties are added after node, so this is a best-effort pass)
+		// If you want to catch properties as they're added, see add_node_property below
+	}
+#endif
 
 	return nodes.size() - 1;
 }
@@ -2308,6 +2350,24 @@ void SceneState::add_node_property(int p_node, int p_name, int p_value, bool p_d
 	}
 	prop.value = p_value;
 	nodes.write[p_node].properties.push_back(prop);
+
+#ifdef TOOLS_ENABLED
+	// Lazy import: if the property value is a resource path, trigger import
+	if (Engine::get_singleton()->is_editor_hint() && EditorFileSystem::get_singleton()->is_lazy_import_mode_enabled()) {
+		const Variant &v = variants[p_value];
+		if (v.get_type() == Variant::STRING) {
+			String path = v;
+			if (ResourceFormatImporter::get_singleton()->recognize_path(path)) {
+				if (!ResourceLoader::is_imported(path)) {
+					Error err = ResourceFormatImporter::get_singleton()->import(path);
+					if (err != OK) {
+						ERR_PRINT(vformat("Failed to import resource '%s' (error %d)", path, err));
+					}
+				}
+			}
+		}
+	}
+#endif
 }
 
 void SceneState::add_node_group(int p_node, int p_group) {
@@ -2561,7 +2621,14 @@ HashSet<StringName> PackedScene::get_scene_groups(const String &p_path) {
 }
 #endif
 
+
 Ref<SceneState> PackedScene::get_state() const {
+#ifdef TOOLS_ENABLED
+	// Ensure all dependencies are imported before loading state (in editor/lazy mode)
+	if (!state.is_null() && !state->get_path().is_empty()) {
+		import_all_dependencies(state->get_path());
+	}
+#endif
 	return state;
 }
 

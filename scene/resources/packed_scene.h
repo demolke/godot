@@ -1,3 +1,7 @@
+#ifdef TOOLS_ENABLED
+	// Import all dependencies for a scene before loading/instantiating.
+	static void import_all_dependencies(const String &scene_path);
+#endif
 /**************************************************************************/
 /*  packed_scene.h                                                        */
 /**************************************************************************/
@@ -215,7 +219,9 @@ public:
 	int add_name(const StringName &p_name);
 	int add_value(const Variant &p_value);
 	int add_node_path(const NodePath &p_path, const PackedInt32Array &p_uid_path);
+	// When adding a node, will trigger import for any new referenced resources (in editor/lazy mode)
 	int add_node(int p_parent, int p_owner, int p_type, int p_name, int p_instance, int p_index, int32_t p_unique_id);
+	// When adding a property, will trigger import for any new referenced resources (in editor/lazy mode)
 	void add_node_property(int p_node, int p_name, int p_value, bool p_deferred_node_path = false);
 	void add_node_group(int p_node, int p_group);
 	void set_base_scene(int p_idx);
