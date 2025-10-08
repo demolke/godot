@@ -1023,18 +1023,7 @@ bool EditorFileSystem::_update_scan_actions() {
 			return true;
 		}
 
-		// During first scan, don't reimport - just collect metadata
-		if (!first_scan) {
-			reimport_files(reimports);
-		} else {
-			// Just update UIDs without importing
-			for (const String &E : reimports) {
-				if (ResourceLoader::get_resource_type(E) == "PackedScene") {
-					// Scenes are loaded normally as they are needed for the editor
-					reimport_files(Vector<String>{E});
-				}
-			}
-		}
+		reimport_files(reimports);
 	} else {
 		//reimport files will update the uid cache file so if nothing was reimported, update it manually
 		ResourceUID::get_singleton()->update_cache();
@@ -1300,13 +1289,11 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				fi->import_dest_paths = Vector<String>();
 				fi->import_valid = (fi->type == "TextFile" || fi->type == "OtherFile") ? true : ResourceLoader::is_import_valid(path);
 
-				if (!ResourceImporter::lazy_import_mode) {
-					ItemAction ia;
-					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
-					ia.dir = p_dir;
-					ia.file = fi->file;
-					scan_actions.push_back(ia);
-				}
+				ItemAction ia;
+				ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+				ia.dir = p_dir;
+				ia.file = fi->file;
+				scan_actions.push_back(ia);
 			}
 		} else {
 			if (fc && fc->modification_time == mt) {
@@ -1565,11 +1552,13 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 		String path = cd.path_join(p_dir->files[i]->file);
 
 		if (_can_import_file(p_dir->files[i]->file)) {
-			// In lazy import mode, we only validate if the import is still valid
-			// but don't actually reimport until first use
+			// Check here if file must be imported or not.
+			// Same logic as in _process_file_system, the last modifications dates
+			// needs to be trusted to prevent reading all the .import files and the md5
+			// each time the user switch back to Godot.
 			uint64_t mt = FileAccess::get_modified_time(path);
 			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
-			if (!ResourceImporter::lazy_import_mode && _is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths)) {
+			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths)) {
 				ItemAction ia;
 				ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 				ia.dir = p_dir;
@@ -2460,16 +2449,10 @@ void EditorFileSystem::update_files(const Vector<String> &p_script_paths) {
 				}
 				cpos = idx;
 			} else {
-				//the file exists and was updated, validate import state
-				ResourceFormatImporter::PathAndType pat;
-				Error err = ResourceFormatImporter::get_singleton()->_get_path_and_type(file, pat, false);
-				if (err == OK) {
-					ResourceImporter::ImportState state = ResourceFormatImporter::get_singleton()->_validate_import_state(file, pat);
-					if (state != ResourceImporter::IMPORT_STATE_VALID) {
-						late_update_files.insert(file);
-						_save_late_updated_files();
-					}
-				}
+				//the file exists and it was updated, and was not added in this step.
+				//this means we must force upon next restart to scan it again, to get proper type and dependencies
+				late_update_files.insert(file);
+				_save_late_updated_files(); //files need to be updated in the re-scan
 			}
 
 			EditorFileSystemDirectory::FileInfo *fi = fs->files[cpos];
@@ -3061,12 +3044,6 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 	print_verbose(vformat("EditorFileSystem: \"%s\" import took %d ms.", p_file, OS::get_singleton()->get_ticks_msec() - start_time));
 
 	ERR_FAIL_COND_V_MSG(err != OK, ERR_FILE_UNRECOGNIZED, "Error importing '" + p_file + "'.");
-
-	// In lazy import mode, mark file for reimport if it was modified
-	if (ResourceImporter::lazy_import_mode) {
-		late_update_files.insert(p_file);
-	}
-	
 	return OK;
 }
 
@@ -3769,14 +3746,6 @@ EditorFileSystem::EditorFileSystem() {
 
 	ResourceLoader::import = _resource_import;
 	reimport_on_missing_imported_files = GLOBAL_GET("editor/import/reimport_missing_imported_files");
-
-	// Initialize lazy import setting
-	GLOBAL_DEF("editor/import/use_lazy_import", false);
-	ProjectSettings::get_singleton()->set_custom_property_info("editor/import/use_lazy_import",
-		PropertyInfo(Variant::BOOL, "editor/import/use_lazy_import", 
-		PROPERTY_HINT_NONE, "When enabled, imported resources will only be imported when first used", PROPERTY_USAGE_DEFAULT));
-	
-	ResourceImporter::lazy_import_mode = GLOBAL_GET("editor/import/use_lazy_import");
 	singleton = this;
 	filesystem = memnew(EditorFileSystemDirectory); //like, empty
 	filesystem->parent = nullptr;

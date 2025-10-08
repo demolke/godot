@@ -48,22 +48,9 @@ class ResourceFormatImporter : public ResourceFormatLoader {
 		String group_file;
 		Variant metadata;
 		ResourceUID::ID uid = ResourceUID::INVALID_ID;
-		Vector<String> imported_files; // List of all generated import files
-		Vector<String> dependencies;   // Import dependencies
-		uint64_t source_modified_time = 0;
-		uint64_t import_modified_time = 0;
-		ImportState import_state = ResourceImporter::IMPORT_STATE_NEEDS_REIMPORT;
 	};
 
-	private:
-
 	Error _get_path_and_type(const String &p_path, PathAndType &r_path_and_type, bool p_load, bool *r_valid = nullptr) const;
-	
-	// Tests if a file needs reimport by checking metadata and dependencies
-	ImportState _validate_import_state(const String &p_path, PathAndType &r_pat) const;
-
-	// Checks if source/import files are modified without reading full metadata
-	bool _test_quick_reimport(const String &p_path, const PathAndType &p_pat) const;
 
 	static inline ResourceFormatImporter *singleton = nullptr;
 
@@ -122,26 +109,13 @@ public:
 class ResourceImporter : public RefCounted {
 	GDCLASS(ResourceImporter, RefCounted);
 
-public:
-	enum ImportState {
-		IMPORT_STATE_VALID,     // Import is up to date
-		IMPORT_STATE_NEEDS_REIMPORT,  // Source/settings changed, needs reimport
-		IMPORT_STATE_INVALID,   // Import failed or corrupt
-	};
-
 protected:
 	GDVIRTUAL1RC(Vector<String>, _get_build_dependencies, String)
 
 	static void _bind_methods();
 
 public:
-	// Callback for loading resources during first scan, used for reimport handling
 	static inline ResourceFormatImporterLoadOnStartup load_on_startup = nullptr;
-
-	// When enabled, resources are only imported when first used rather than during scanning.
-	// This improves startup performance by deferring imports until actually needed.
-	// Set via editor/import/use_lazy_import project setting.
-	static inline bool lazy_import_mode = false;
 
 	virtual String get_importer_name() const = 0;
 	virtual String get_visible_name() const = 0;
