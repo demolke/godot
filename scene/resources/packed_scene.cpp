@@ -1,3 +1,6 @@
+#ifdef TOOLS_ENABLED
+#include "editor/file_system/editor_file_system.h"
+#endif
 /**************************************************************************/
 /*  packed_scene.cpp                                                      */
 /**************************************************************************/
@@ -31,9 +34,11 @@
 #include "packed_scene.h"
 
 #include "core/config/engine.h"
+#include "core/config/project_settings.h"
 #include "core/io/file_access.h"
 #include "core/io/missing_resource.h"
 #include "core/io/resource_loader.h"
+#include "core/io/resource_importer.h"
 #include "core/templates/local_vector.h"
 #include "scene/2d/node_2d.h"
 #include "scene/gui/control.h"
@@ -2473,26 +2478,67 @@ bool PackedScene::can_instantiate() const {
 }
 
 Node *PackedScene::instantiate(GenEditState p_edit_state) const {
-#ifndef TOOLS_ENABLED
-	ERR_FAIL_COND_V_MSG(p_edit_state != GEN_EDIT_STATE_DISABLED, nullptr, "Edit state is only for editors, does not work without tools compiled.");
-#endif
+       #ifndef TOOLS_ENABLED
+       ERR_FAIL_COND_V_MSG(p_edit_state != GEN_EDIT_STATE_DISABLED, nullptr, "Edit state is only for editors, does not work without tools compiled.");
+       #endif
 
-	Node *s = state->instantiate((SceneState::GenEditState)p_edit_state);
-	if (!s) {
-		return nullptr;
-	}
+       // --- Lazy import: ensure all referenced resources are imported before instantiating ---
+	#ifdef TOOLS_ENABLED
+	if (ProjectSettings::get_singleton()->get_setting("editor/import/use_lazy_import", false)) {
+	       // Gather all referenced resources (subresources and nested scenes)
+	       Vector<String> to_import;
+	       // Add subresources
+	       Vector<Ref<Resource>> subresources = state->get_sub_resources();
+	       for (int i = 0; i < subresources.size(); i++) {
+		       Ref<Resource> res = subresources[i];
+		       if (res.is_valid() && res->get_path().is_resource_file()) {
+			       to_import.push_back(res->get_path());
+		       }
+	       }
+	       // Add nested scene dependencies (recursively)
+	       // Use ResourceLoader::get_dependencies to get all referenced files
+	       List<String> deps;
+	       ResourceLoader::get_dependencies(get_path(), &deps);
+	       for (const String &dep : deps) {
+		       to_import.push_back(dep);
+	       }
+	       // Remove duplicates
+	       HashSet<String> unique_imports;
+	       for (int i = 0; i < to_import.size(); i++) {
+		       unique_imports.insert(to_import[i]);
+	       }
+	       Vector<String> import_list;
+	       for (const String &path : unique_imports) {
+		       // Only import if importable and not already imported
+		       if (ResourceFormatImporter::get_singleton()->recognize_path(path)) {
+			       if (!ResourceLoader::is_import_valid(path)) {
+				       import_list.push_back(path);
+			       }
+		       }
+	       }
+	       if (!import_list.is_empty()) {
+		       // Synchronously import all needed resources
+		       EditorFileSystem::get_singleton()->reimport_files(import_list);
+	       }
+       }
+       #endif
 
-	if (p_edit_state != GEN_EDIT_STATE_DISABLED) {
-		s->set_scene_instance_state(state);
-	}
+       Node *s = state->instantiate((SceneState::GenEditState)p_edit_state);
+       if (!s) {
+	       return nullptr;
+       }
 
-	if (!is_built_in()) {
-		s->set_scene_file_path(get_path());
-	}
+       if (p_edit_state != GEN_EDIT_STATE_DISABLED) {
+	       s->set_scene_instance_state(state);
+       }
 
-	s->notification(Node::NOTIFICATION_SCENE_INSTANTIATED);
+       if (!is_built_in()) {
+	       s->set_scene_file_path(get_path());
+       }
 
-	return s;
+       s->notification(Node::NOTIFICATION_SCENE_INSTANTIATED);
+
+       return s;
 }
 
 void PackedScene::replace_state(Ref<SceneState> p_by) {

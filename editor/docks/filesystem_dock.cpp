@@ -3021,6 +3021,27 @@ void FileSystemDock::drop_data_fw(const Point2 &p_point, const Variant &p_data, 
 	}
 	Dictionary drag_data = p_data;
 
+	// --- Lazy import: ensure all dragged files are imported before operation ---
+#ifdef TOOLS_ENABLED
+	if (bool(GLOBAL_GET("editor/import/use_lazy_import"))) {
+		Vector<String> files_to_import;
+		if (drag_data.has("files")) {
+			Vector<String> fnames = drag_data["files"];
+			for (int i = 0; i < fnames.size(); i++) {
+				String path = fnames[i];
+				if (ResourceFormatImporter::get_singleton()->recognize_path(path)) {
+					if (!ResourceLoader::is_import_valid(path)) {
+						files_to_import.push_back(path);
+					}
+				}
+			}
+		}
+		if (!files_to_import.is_empty()) {
+			EditorFileSystem::get_singleton()->reimport_files(files_to_import);
+		}
+	}
+#endif
+
 	Vector<String> dirs = EditorSettings::get_singleton()->get_favorites();
 
 	if (drag_data.has("favorite")) {
