@@ -40,6 +40,7 @@
 #include "core/variant/variant_utility.h"
 #include "editor/editor_node.h"
 #include "editor/editor_string_names.h"
+#include "editor/file_system/editor_file_system.h"
 #include "editor/file_system/editor_paths.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
@@ -152,7 +153,7 @@ void EditorResourcePreview::_preview_ready(const String &p_path, int p_hash, con
 
 		uint64_t modified_time = 0;
 
-		if (!p_path.begins_with("ID:")) {
+		if (!p_path.begins_with("ID:") && !(EditorFileSystem::get_singleton() && EditorFileSystem::get_singleton()->is_deferred_import(p_path))) {
 			modified_time = FileAccess::get_modified_time(p_path);
 			String import_path = p_path + ".import";
 			if (FileAccess::exists(import_path)) {
@@ -314,6 +315,15 @@ void EditorResourcePreview::_iterate() {
 		Dictionary preview_metadata;
 		_generate_preview(texture, small_texture, item, String(), preview_metadata);
 		_preview_ready(item.path, item.resource->hash_edited_version_for_preview(), texture, small_texture, item.callback, preview_metadata);
+		return;
+	}
+
+	// In on-demand import mode, skip loading the source for preview if the file
+	// has never been imported. Hovering the FileSystem dock would otherwise
+	// trigger imports for every visible asset.
+	if (EditorFileSystem::get_singleton() && EditorFileSystem::get_singleton()->is_deferred_import(item.path)) {
+		Dictionary preview_metadata;
+		_preview_ready(item.path, 0, Ref<ImageTexture>(), Ref<ImageTexture>(), item.callback, preview_metadata);
 		return;
 	}
 

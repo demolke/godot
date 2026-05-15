@@ -245,11 +245,23 @@ void ResourceFormatImporter::get_recognized_extensions_for_type(const String &p_
 }
 
 bool ResourceFormatImporter::exists(const String &p_path) const {
-	return FileAccess::exists(p_path + ".import");
+	return recognize_path(p_path);
 }
 
 bool ResourceFormatImporter::recognize_path(const String &p_path, const String &p_for_type) const {
-	return FileAccess::exists(p_path + ".import");
+	if (FileAccess::exists(p_path + ".import")) {
+		return true;
+	}
+	if (ResourceImporter::on_demand_imports) {
+		Ref<ResourceImporter> importer = get_importer_by_file(p_path);
+		if (importer.is_valid()) {
+			if (!p_for_type.is_empty() && importer->get_resource_type() != p_for_type && !ClassDB::is_parent_class(importer->get_resource_type(), p_for_type)) {
+				return false;
+			}
+			return FileAccess::exists(p_path);
+		}
+	}
+	return false;
 }
 
 Error ResourceFormatImporter::get_import_order_threads_and_importer(const String &p_path, int &r_order, bool &r_can_threads, String &r_importer) const {
@@ -376,6 +388,9 @@ String ResourceFormatImporter::get_import_group_file(const String &p_path) const
 }
 
 bool ResourceFormatImporter::is_import_valid(const String &p_path) const {
+	if (ResourceImporter::on_demand_imports && !FileAccess::exists(p_path + ".import")) {
+		return get_importer_by_file(p_path).is_valid() && FileAccess::exists(p_path);
+	}
 	bool valid = true;
 	PathAndType pat;
 	_get_path_and_type(p_path, pat, false, &valid);
@@ -387,6 +402,16 @@ String ResourceFormatImporter::get_resource_type(const String &p_path) const {
 	Error err = _get_path_and_type(p_path, pat, false);
 
 	if (err != OK) {
+		// On-demand imports: the file is recognized by an importer but hasn't
+		// been imported yet, so no .import file exists. Infer the post-import
+		// type from the importer registry so editor code (drag-and-drop, asset
+		// pickers, previews) can recognize the resource before its first load.
+		if (ResourceImporter::on_demand_imports && !FileAccess::exists(p_path + ".import") && FileAccess::exists(p_path)) {
+			Ref<ResourceImporter> importer = get_importer_by_file(p_path);
+			if (importer.is_valid()) {
+				return importer->get_resource_type();
+			}
+		}
 		return "";
 	}
 
