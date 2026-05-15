@@ -1132,7 +1132,9 @@ void EditorFileSystem::scan() {
 		// Set first_scan to false before the signals so the function doing_first_scan can return false
 		// in editor_node to start the export if needed.
 		first_scan = false;
-		ResourceImporter::load_on_startup = nullptr;
+		if (!ResourceImporter::on_demand_imports) {
+			ResourceImporter::load_on_startup = nullptr;
+		}
 		emit_signal(SNAME("filesystem_changed"));
 		emit_signal(SNAME("sources_changed"), sources_changed.size() > 0);
 	} else {
@@ -1258,7 +1260,28 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 			//is imported
 			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
 
-			if (fc) {
+			if (ResourceImporter::on_demand_imports && import_mt == 0) {
+				// Deferred import: file is importable but has never been imported.
+				// Populate enough info to display it in the FileSystem dock and record
+				// the real modification time so subsequent scans don't false-mismatch.
+				// No ACTION_FILE_TEST_REIMPORT is queued — import is deferred until first access.
+				if (fc) {
+					// Reuse cached metadata; do NOT call ResourceLoader fallbacks for type/uid
+					// here since those would try to recognize/load the unimported file.
+					fi->type = fc->type;
+					fi->resource_script_class = fc->resource_script_class;
+					fi->uid = fc->uid;
+					fi->deps = fc->deps;
+					fi->import_group_file = fc->import_group_file;
+					fi->class_info = fc->class_info;
+				}
+				if (fi->type.is_empty()) {
+					fi->type = ResourceFormatImporter::get_singleton()->get_resource_type(path);
+				}
+				fi->modified_time = mt;
+				fi->import_valid = true;
+
+			} else if (fc) {
 				fi->type = fc->type;
 				fi->resource_script_class = fc->resource_script_class;
 				fi->uid = fc->uid;
@@ -1544,7 +1567,7 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 						scan_actions.push_back(ia);
 					}
 
-					if (_can_import_file(f)) {
+					if (_can_import_file(f) && (!ResourceImporter::on_demand_imports || FileAccess::exists(path + ".import"))) {
 						//if it can be imported, and it was added, it needs to be reimported
 						ItemAction ia;
 						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
@@ -1583,7 +1606,8 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 			// each time the user switch back to Godot.
 			uint64_t mt = FileAccess::get_modified_time(path);
 			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
-			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths)) {
+			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths) &&
+					(!ResourceImporter::on_demand_imports || import_mt != 0)) {
 				ItemAction ia;
 				ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 				ia.dir = p_dir;
@@ -1791,7 +1815,9 @@ void EditorFileSystem::_notification(int p_what) {
 						first_scan = false;
 						scanning_changes = false;
 						done_importing = true;
-						ResourceImporter::load_on_startup = nullptr;
+						if (!ResourceImporter::on_demand_imports) {
+							ResourceImporter::load_on_startup = nullptr;
+						}
 						if (changed) {
 							emit_signal(SNAME("filesystem_changed"));
 						}
@@ -1811,7 +1837,9 @@ void EditorFileSystem::_notification(int p_what) {
 					// Set first_scan to false before the signals so the function doing_first_scan can return false
 					// in editor_node to start the export if needed.
 					first_scan = false;
-					ResourceImporter::load_on_startup = nullptr;
+					if (!ResourceImporter::on_demand_imports) {
+						ResourceImporter::load_on_startup = nullptr;
+					}
 					emit_signal(SNAME("filesystem_changed"));
 					emit_signal(SNAME("sources_changed"), sources_changed.size() > 0);
 				}
@@ -2923,7 +2951,12 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 	}
 
 	if (uid == ResourceUID::INVALID_ID) {
-		uid = ResourceUID::get_singleton()->create_id_for_path(p_file);
+		if (fs && cpos != -1) {
+			uid = fs->files[cpos]->uid;
+		}
+		if (uid == ResourceUID::INVALID_ID) {
+			uid = ResourceUID::get_singleton()->create_id_for_path(p_file);
+		}
 	}
 
 	//finally, perform import!!
@@ -3454,6 +3487,7 @@ Error EditorFileSystem::_resource_import(const String &p_path) {
 
 Ref<Resource> EditorFileSystem::_load_resource_on_startup(ResourceFormatImporter *p_importer, const String &p_path, Error *r_error, bool p_use_sub_threads, float *r_progress, ResourceLoaderConstants::CacheMode p_cache_mode) {
 	ERR_FAIL_NULL_V(p_importer, Ref<Resource>());
+	ERR_FAIL_NULL_V(singleton, Ref<Resource>());
 
 	if (!FileAccess::exists(p_path)) {
 		ERR_FAIL_V_MSG(Ref<Resource>(), vformat("Failed loading resource: %s. The file doesn't seem to exist.", p_path));
@@ -3465,9 +3499,19 @@ Ref<Resource> EditorFileSystem::_load_resource_on_startup(ResourceFormatImporter
 		return res;
 	}
 
-	// Retry after importing the resource.
-	if (singleton->_reimport_file(p_path, HashMap<StringName, Variant>(), "", nullptr, false) != OK) {
-		return Ref<Resource>();
+	{
+		MutexLock lock(singleton->load_on_startup_mutex);
+		// Another thread may have imported the resource while waiting for the lock.
+		res = p_importer->load_internal(p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode, true);
+		if (res.is_valid()) {
+			return res;
+		}
+
+		bool can_update_fs = !singleton->scanning_changes && singleton->find_file(p_path) != nullptr;
+		// Retry after importing the resource.
+		if (singleton->_reimport_file(p_path, HashMap<StringName, Variant>(), "", nullptr, can_update_fs) != OK) {
+			return Ref<Resource>();
+		}
 	}
 	return p_importer->load_internal(p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode, false);
 }
@@ -3760,6 +3804,16 @@ void EditorFileSystem::_update_extensions() {
 	}
 }
 
+bool EditorFileSystem::is_deferred_import(const String &p_path) {
+	if (!ResourceImporter::on_demand_imports) {
+		return false;
+	}
+	if (!_can_import_file(p_path)) {
+		return false;
+	}
+	return !FileAccess::exists(p_path + ".import");
+}
+
 bool EditorFileSystem::_can_import_file(const String &p_file) {
 	for (const String &F : import_extensions) {
 		if (p_file.right(F.length()).nocasecmp_to(F) == 0) {
@@ -3787,6 +3841,7 @@ EditorFileSystem::EditorFileSystem() {
 
 	ResourceLoader::import = _resource_import;
 	reimport_on_missing_imported_files = GLOBAL_GET("editor/import/reimport_missing_imported_files");
+	ResourceImporter::on_demand_imports = GLOBAL_GET("editor/import/on_demand_imports");
 	singleton = this;
 	filesystem = memnew(EditorFileSystemDirectory); //like, empty
 	filesystem->parent = nullptr;
@@ -3812,4 +3867,9 @@ EditorFileSystem::~EditorFileSystem() {
 	memdelete(filesystem);
 	filesystem = nullptr;
 	ResourceSaver::set_get_resource_id_for_path(nullptr);
+	if (singleton == this) {
+		singleton = nullptr;
+		ResourceLoader::import = nullptr;
+		ResourceImporter::load_on_startup = nullptr;
+	}
 }

@@ -1479,6 +1479,9 @@ Error EditorExportPlatform::export_project_files(const Ref<EditorExportPreset> &
 
 		String type = ResourceLoader::get_resource_type(path);
 
+		if (EditorFileSystem::get_singleton()->is_deferred_import(path)) {
+			continue;
+		}
 		bool has_import_file = FileAccess::exists(path + ".import");
 		Ref<ConfigFile> config;
 		if (has_import_file) {
