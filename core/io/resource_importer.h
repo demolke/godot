@@ -117,6 +117,7 @@ protected:
 
 public:
 	static inline ResourceFormatImporterLoadOnStartup load_on_startup = nullptr;
+	static inline bool on_demand_imports = false;
 
 	virtual String get_importer_name() const = 0;
 	virtual String get_visible_name() const = 0;
