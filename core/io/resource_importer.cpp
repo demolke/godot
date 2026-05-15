@@ -387,6 +387,16 @@ String ResourceFormatImporter::get_resource_type(const String &p_path) const {
 	Error err = _get_path_and_type(p_path, pat, false);
 
 	if (err != OK) {
+		// On-demand imports: the file is recognized by an importer but hasn't
+		// been imported yet, so no .import file exists. Infer the post-import
+		// type from the importer registry so editor code (drag-and-drop, asset
+		// pickers, previews) can recognize the resource before its first load.
+		if (ResourceImporter::on_demand_imports) {
+			Ref<ResourceImporter> importer = get_importer_by_file(p_path);
+			if (importer.is_valid()) {
+				return importer->get_resource_type();
+			}
+		}
 		return "";
 	}
 
