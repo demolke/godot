@@ -1133,6 +1133,9 @@
 		<member name="editor/import/atlas_max_width" type="int" setter="" getter="" default="2048">
 			The maximum width to use when importing textures as an atlas. The value will be rounded to the nearest power of two when used. Use this to prevent imported textures from growing too large in the other direction.
 		</member>
+		<member name="editor/import/on_demand_imports" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], assets are imported the first time they are accessed (e.g. when opening a scene that references them) instead of being imported eagerly during the initial filesystem scan. This can dramatically reduce editor startup time for large projects, at the cost of a brief delay the first time each unused asset is loaded.
+		</member>
 		<member name="editor/import/reimport_missing_imported_files" type="bool" setter="" getter="" default="true">
 		</member>
 		<member name="editor/import/use_multiple_threads" type="bool" setter="" getter="" default="true">
