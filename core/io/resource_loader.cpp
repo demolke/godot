@@ -307,6 +307,13 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 			// The format is known to the editor, but the file hasn't been imported
 			// (otherwise, ResourceFormatImporter would have been found as a suitable loader).
 			found = true;
+			if (ResourceImporter::on_demand_imports && ResourceImporter::load_on_startup != nullptr) {
+				// On-demand imports: trigger import now and return the loaded resource.
+				res = ResourceImporter::load_on_startup(ResourceFormatImporter::get_singleton(), p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode);
+				if (res.is_valid()) {
+					return res;
+				}
+			}
 			if (r_error) {
 				*r_error = ERR_FILE_NOT_FOUND;
 			}
