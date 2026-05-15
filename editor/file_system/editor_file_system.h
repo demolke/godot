@@ -332,6 +332,7 @@ class EditorFileSystem : public Node {
 
 	ScriptClassInfo _get_global_script_class(const String &p_type, const String &p_path) const;
 
+	Mutex load_on_startup_mutex;
 	static Error _resource_import(const String &p_path);
 	static Ref<Resource> _load_resource_on_startup(ResourceFormatImporter *p_importer, const String &p_path, Error *r_error, bool p_use_sub_threads, float *r_progress, ResourceLoaderConstants::CacheMode p_cache_mode);
 
@@ -394,13 +395,14 @@ public:
 	void update_file(const String &p_file);
 	void update_files(const Vector<String> &p_script_paths);
 	HashSet<String> get_valid_extensions() const;
+	bool is_deferred_import(const String &p_path);
 	void register_global_class_script(const String &p_search_path, const String &p_target_path);
 
 	void filesystem_changed();
 
 	EditorFileSystemDirectory *get_filesystem_path(const String &p_path);
 	String get_file_type(const String &p_file) const;
-	EditorFileSystemDirectory *find_file(const String &p_file, int *r_index) const;
+	EditorFileSystemDirectory *find_file(const String &p_file, int *r_index = nullptr) const;
 	ResourceUID::ID get_file_uid(const String &p_path) const;
 
 	void reimport_files(const Vector<String> &p_files);
