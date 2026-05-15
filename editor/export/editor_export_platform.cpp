@@ -1523,6 +1523,9 @@ Error EditorExportPlatform::export_project_files(const Ref<EditorExportPreset> &
 		String type = ResourceLoader::get_resource_type(path);
 
 		bool has_import_file = FileAccess::exists(path + ".import");
+		if (!has_import_file && EditorFileSystem::get_singleton()->is_deferred_import(path)) {
+			continue;
+		}
 		Ref<ConfigFile> config;
 		if (has_import_file) {
 			config.instantiate();
