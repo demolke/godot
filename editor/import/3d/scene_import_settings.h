@@ -101,7 +101,7 @@ class SceneImportSettingsDialog : public ConfirmationDialog {
 	MeshInstance3D *mesh_preview = nullptr;
 	Ref<SphereMesh> material_preview;
 
-	AnimationPlayer *animation_player = nullptr;
+	AnimationPlayer *preview_player = nullptr;
 	List<Skeleton3D *> skeletons;
 	PanelContainer *animation_preview = nullptr;
 	HSlider *animation_slider = nullptr;
@@ -153,6 +153,7 @@ class SceneImportSettingsDialog : public ConfirmationDialog {
 
 	struct AnimationData {
 		Ref<Animation> animation;
+		AnimationPlayer *player = nullptr;
 		TreeItem *scene_node = nullptr;
 		HashMap<StringName, Variant> settings;
 	};
@@ -169,7 +170,7 @@ class SceneImportSettingsDialog : public ConfirmationDialog {
 	void _set_default(const StringName &p_name, const Variant &p_value);
 	void _fill_material(Tree *p_tree, const Ref<Material> &p_material, TreeItem *p_parent);
 	void _fill_mesh(Tree *p_tree, const Ref<Mesh> &p_mesh, TreeItem *p_parent);
-	void _fill_animation(Tree *p_tree, const Ref<Animation> &p_anim, const String &p_name, TreeItem *p_parent);
+	void _fill_animation(Tree *p_tree, const Ref<Animation> &p_anim, const String &p_name, AnimationPlayer *p_player, TreeItem *p_parent);
 	void _fill_scene(Node *p_node, TreeItem *p_parent_item);
 
 	HashSet<Ref<Mesh>> mesh_set;
@@ -184,6 +185,8 @@ class SceneImportSettingsDialog : public ConfirmationDialog {
 	void _select(Tree *p_from, const String &p_type, const String &p_id);
 	void _inspector_property_edited(const String &p_name);
 	void _reset_bone_transforms();
+	void _stop_all_animation_players(AnimationPlayer *p_except = nullptr);
+	void _set_preview_player(AnimationPlayer *p_player);
 	void _play_animation();
 	void _stop_current_animation();
 	void _reset_animation(const String &p_animation_name = "");
