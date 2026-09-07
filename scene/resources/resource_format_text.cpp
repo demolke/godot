@@ -55,11 +55,12 @@ Error ResourceLoaderText::_parse_sub_resource_dummy(DummyReadData *p_data, Varia
 		return ERR_PARSE_ERROR;
 	}
 
+	String unique_id = token.value;
+	p_data->touched_sub_ids.insert(unique_id);
+
 	if (p_data->no_placeholders) {
 		r_res.unref();
 	} else {
-		String unique_id = token.value;
-
 		if (!p_data->resource_map.has(unique_id)) {
 			r_err_str = "Found unique_id reference before mapping, sub-resources stored out of order in resource file";
 			return ERR_PARSE_ERROR;
@@ -85,11 +86,12 @@ Error ResourceLoaderText::_parse_ext_resource_dummy(DummyReadData *p_data, Varia
 		return ERR_PARSE_ERROR;
 	}
 
+	String id = token.value;
+	p_data->touched_ext_ids.insert(id);
+
 	if (p_data->no_placeholders) {
 		r_res.unref();
 	} else {
-		String id = token.value;
-
 		ERR_FAIL_COND_V(!p_data->rev_external_resources.has(id), ERR_PARSE_ERROR);
 
 		r_res = p_data->rev_external_resources[id];
@@ -142,9 +144,10 @@ Error ResourceLoaderText::_parse_ext_resource(VariantParser::Stream *p_stream, R
 			return ERR_PARSE_ERROR;
 		}
 
-		String path = ext_resources[id].path;
-		String type = ext_resources[id].type;
-		Ref<ResourceLoader::LoadToken> &load_token = ext_resources[id].load_token;
+	String path = ext_resources[id].path;
+	String type = ext_resources[id].type;
+	const String &subroot = ext_resources[id].subroot;
+	Ref<ResourceLoader::LoadToken> &load_token = ext_resources[id].load_token;
 
 		if (load_token.is_valid()) { // If not valid, it's OK since then we know this load accepts broken dependencies.
 			Ref<Resource> res = ResourceLoader::_load_complete(*load_token.ptr(), &err);
@@ -158,6 +161,28 @@ Error ResourceLoaderText::_parse_ext_resource(VariantParser::Stream *p_stream, R
 					} else {
 						ResourceLoader::notify_dependency_error(local_path, path, type);
 					}
+				}
+			} else if (!subroot.is_empty()) {
+				// subroot= references the sub-tree of another scene as a PackedScene.
+				// Only PackedScene is supported for now.
+				Ref<PackedScene> scene = res;
+				if (subroot.contains(ResourceFormatLoaderSubScene::SUB_SCENE_SEPARATOR)) {
+					error_text = vformat("[ext_resource] subroot= reference '%s' must not contain '%s'.", subroot, ResourceFormatLoaderSubScene::SUB_SCENE_SEPARATOR);
+				} else if (!scene.is_valid() || !scene->get_state().is_valid()) {
+					error_text = "[ext_resource] subroot= reference requires a PackedScene at: " + path;
+				} else {
+					const String synthetic = ResourceFormatLoaderSubScene::make_sub_path(path, subroot);
+					r_res = PackedScene::create_sub_reference(scene, NodePath(subroot), synthetic);
+					if (r_res.is_null()) {
+						error_text = vformat("[ext_resource] could not extract sub-scene '%s' from '%s'", subroot, path);
+					}
+				}
+				if (r_res.is_null() && ResourceLoader::get_abort_on_missing_resources()) {
+					error = ERR_FILE_MISSING_DEPENDENCIES;
+					ERR_PRINT(_get_error_string());
+					err = error;
+				} else if (r_res.is_null()) {
+					ResourceLoader::notify_dependency_error(local_path, path, type);
 				}
 			} else {
 				r_res = res;
@@ -504,7 +529,13 @@ Error ResourceLoaderText::load() {
 
 		ext_resources[id].path = path;
 		ext_resources[id].type = type;
-		ext_resources[id].load_token = ResourceLoader::_load_start(path, type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
+		if (next_tag.fields.has("subroot")) {
+			ext_resources[id].subroot = next_tag.fields["subroot"];
+		}
+		// A node reference loads the whole scene at `path`, then extracts the
+		// sub-resource held by the node. PackedScene is forced as the load type.
+		const String load_type = ext_resources[id].subroot.is_empty() ? type : String("PackedScene");
+		ext_resources[id].load_token = ResourceLoader::_load_start(path, load_type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
 		if (ext_resources[id].load_token.is_null()) {
 			if (ResourceLoader::get_abort_on_missing_resources()) {
 				error = ERR_FILE_CORRUPT;
@@ -1066,13 +1097,17 @@ Error ResourceLoaderText::rename_dependencies(Ref<FileAccess> p_f, const String 
 				path = base_path.path_to_file(path);
 			}
 
-			String s = "[ext_resource type=\"" + type + "\"";
+		String s = "[ext_resource type=\"" + type + "\"";
 
-			ResourceUID::ID uid = ResourceSaver::get_resource_id_for_path(path);
-			if (uid != ResourceUID::INVALID_ID) {
-				s += " uid=\"" + ResourceUID::get_singleton()->id_to_text(uid) + "\"";
-			}
-			s += " path=\"" + path + "\" id=\"" + id + "\"]";
+		ResourceUID::ID uid = ResourceSaver::get_resource_id_for_path(path);
+		if (uid != ResourceUID::INVALID_ID) {
+			s += " uid=\"" + ResourceUID::get_singleton()->id_to_text(uid) + "\"";
+		}
+		s += " path=\"" + path + "\"";
+		if (next_tag.fields.has("subroot")) {
+			s += " subroot=\"" + String(next_tag.fields["subroot"]) + "\"";
+		}
+			s += " id=\"" + id + "\"]";
 			fw->store_line(s); // Bundled.
 
 			tag_end = f->get_position();
@@ -1289,6 +1324,235 @@ Error ResourceLoaderText::get_classes_used(HashSet<StringName> *r_classes) {
 				error = ERR_FILE_CORRUPT;
 				error_text = "Premature end of file while parsing [sub_resource]";
 				ERR_FAIL_V_MSG(error, _get_error_string());
+			}
+		}
+	}
+
+	return OK;
+}
+
+Error ResourceLoaderText::scan_required_ext_resources(const NodePath &p_root_filter, HashSet<String> &r_all_ext_ids, HashSet<String> &r_required_ext_ids) {
+	if (error) {
+		return error;
+	}
+
+	ignore_resource_parsing = true;
+
+	DummyReadData dummy_read;
+	dummy_read.no_placeholders = true;
+	VariantParser::ResourceParser rp_scan;
+	rp_scan.ext_func = _parse_ext_resource_dummys;
+	rp_scan.sub_func = _parse_sub_resource_dummys;
+	rp_scan.userdata = &dummy_read;
+
+	// IMPORTANT: parse_tag_assign_eof(), on discovering the *next* tag, calls
+	// parse_tag() internally to read that tag's header -- including any
+	// resource-valued fields on it (e.g. a [node]'s instance=ExtResource(...))
+	// -- via the SAME resource parser passed to parse_tag_assign_eof() itself.
+	// That means a tag's own header touches dummy_read.touched_ext_ids/
+	// touched_sub_ids as a side effect of finishing the *previous* tag's
+	// parse, not while "inside" its own iteration. To attribute touches to
+	// the right tag, dummy_read.touched_ext_ids/sub_ids is cleared and read
+	// back after every individual parse_tag_assign_eof() call (not once per
+	// tag), and a touch is filed under "this tag's body" if the call
+	// resolved a property assignment, or carried forward as the seed for
+	// the *next* tag if the call is what discovered it.
+	HashSet<String> pending_ext, pending_sub;
+
+	// [ext_resource] tags carry no property values of their own -- just note
+	// every id that exists, so the caller can compute skip = all - required.
+	while (next_tag.name == "ext_resource") {
+		if (next_tag.fields.has("id")) {
+			r_all_ext_ids.insert(String(next_tag.fields["id"]));
+		}
+		dummy_read.touched_ext_ids.clear();
+		dummy_read.touched_sub_ids.clear();
+		error = VariantParser::parse_tag(&stream, lines, error_text, next_tag, &rp_scan);
+		ERR_FAIL_COND_V_MSG(error, error, _get_error_string());
+		pending_ext = dummy_read.touched_ext_ids;
+		pending_sub = dummy_read.touched_sub_ids;
+	}
+
+	// sub_resource id -> the ext/sub ids directly referenced by its own properties.
+	HashMap<String, HashSet<String>> sub_resource_ext_refs;
+	HashMap<String, HashSet<String>> sub_resource_sub_refs;
+
+	while (next_tag.name == "sub_resource" || next_tag.name == "resource") {
+		String sub_id = next_tag.fields.has("id") ? String(next_tag.fields["id"]) : String();
+		// [sub_resource]/[resource] tags have no resource-valued header
+		// fields of their own (only "type"/"id"), so the pending seed here
+		// is never actually meaningful -- carried forward purely so the
+		// scheme stays uniform and the first [node] tag's seed (below)
+		// isn't accidentally dropped if a scene happens to have zero
+		// sub_resources.
+		HashSet<String> sub_ext;
+		sub_ext = pending_ext;
+		HashSet<String> sub_sub;
+		sub_sub = pending_sub;
+		pending_ext.clear();
+		pending_sub.clear();
+
+		while (true) {
+			String assign;
+			Variant value;
+			dummy_read.touched_ext_ids.clear();
+			dummy_read.touched_sub_ids.clear();
+			error = VariantParser::parse_tag_assign_eof(&stream, lines, error_text, next_tag, assign, value, &rp_scan);
+			if (error) {
+				ERR_FAIL_COND_V_MSG(error != ERR_FILE_EOF, error, _get_error_string());
+				sub_id = String(); // Truncated file; don't record a partial entry.
+				break;
+			}
+			if (!assign.is_empty()) {
+				for (const String &id : dummy_read.touched_ext_ids) {
+					sub_ext.insert(id);
+				}
+				for (const String &id : dummy_read.touched_sub_ids) {
+					sub_sub.insert(id);
+				}
+				continue;
+			} else if (!next_tag.name.is_empty()) {
+				// This call is what discovered the next tag -- whatever it
+				// touched belongs to THAT tag's header, not this sub_resource.
+				pending_ext = dummy_read.touched_ext_ids;
+				pending_sub = dummy_read.touched_sub_ids;
+				error = OK;
+				break;
+			} else {
+				error = ERR_FILE_CORRUPT;
+				error_text = "Premature end of file while parsing [sub_resource]";
+				ERR_FAIL_V_MSG(error, _get_error_string());
+			}
+		}
+
+		if (!sub_id.is_empty()) {
+			sub_resource_ext_refs[sub_id] = sub_ext;
+			sub_resource_sub_refs[sub_id] = sub_sub;
+		}
+	}
+
+	// Node path (relative to this file's own scene root) -> the ext/sub ids
+	// directly referenced by that node's own tag fields (e.g. instance=) and
+	// body properties. The "parent" tag field is already the parent's full
+	// path from the scene root, so paths build up with simple string
+	// concatenation -- no need to resolve node indices the way the real
+	// loader does.
+	Vector<String> node_paths;
+	Vector<HashSet<String>> node_ext_refs;
+	Vector<HashSet<String>> node_sub_refs;
+
+	while (next_tag.name == "node") {
+		if (!is_scene) {
+			error = ERR_FILE_CORRUPT;
+			error_text = "Unexpected 'node' tag in a resource file";
+			ERR_FAIL_V_MSG(error, _get_error_string());
+		}
+
+		String path;
+		if (node_paths.is_empty()) {
+			path = "."; // The file's own scene root.
+		} else if (next_tag.fields.has("parent")) {
+			String parent_path = String(next_tag.fields["parent"]);
+			String name = next_tag.fields.has("name") ? String(next_tag.fields["name"]) : String();
+			path = (parent_path.is_empty() || parent_path == ".") ? name : parent_path + "/" + name;
+		} else {
+			path = "."; // Malformed, but harmless to treat as another root.
+		}
+
+		// Seed with this node's own header-field touches (e.g. instance=),
+		// captured by whichever earlier call discovered this tag.
+		HashSet<String> node_ext;
+		node_ext = pending_ext;
+		HashSet<String> node_sub;
+		node_sub = pending_sub;
+		pending_ext.clear();
+		pending_sub.clear();
+
+		while (true) {
+			String assign;
+			Variant value;
+			dummy_read.touched_ext_ids.clear();
+			dummy_read.touched_sub_ids.clear();
+			error = VariantParser::parse_tag_assign_eof(&stream, lines, error_text, next_tag, assign, value, &rp_scan);
+			// ERR_FILE_MISSING_DEPENDENCIES = Resource loading error; can't
+			// happen here since rp_scan never actually loads anything, but
+			// tolerate it like get_classes_used() does, just in case.
+			if (error && error != ERR_FILE_MISSING_DEPENDENCIES) {
+				ERR_FAIL_COND_V_MSG(error != ERR_FILE_EOF, error, _get_error_string());
+				break;
+			}
+			if (!assign.is_empty()) {
+				for (const String &id : dummy_read.touched_ext_ids) {
+					node_ext.insert(id);
+				}
+				for (const String &id : dummy_read.touched_sub_ids) {
+					node_sub.insert(id);
+				}
+				continue;
+			} else if (!next_tag.name.is_empty()) {
+				// This call discovered the next tag (another [node], or
+				// EOF-adjacent); its header touches belong to THAT tag, not
+				// this one.
+				pending_ext = dummy_read.touched_ext_ids;
+				pending_sub = dummy_read.touched_sub_ids;
+				error = OK;
+				break;
+			} else {
+				error = ERR_FILE_CORRUPT;
+				error_text = "Premature end of file while parsing [node]";
+				ERR_FAIL_V_MSG(error, _get_error_string());
+			}
+		}
+
+		node_paths.push_back(path);
+		// HashSet's copy constructor is explicit, so push_back(HashSet) won't
+		// implicitly convert -- resize then assign via operator= instead.
+		node_ext_refs.resize(node_ext_refs.size() + 1);
+		node_ext_refs.write[node_ext_refs.size() - 1] = node_ext;
+		node_sub_refs.resize(node_sub_refs.size() + 1);
+		node_sub_refs.write[node_sub_refs.size() - 1] = node_sub;
+	}
+
+	// A node is in scope if it *is* the filter root or a descendant of it.
+	// An empty filter (root="" / ".") means the whole scene, i.e. everything.
+	const String filter = (p_root_filter.is_empty() || String(p_root_filter) == ".") ? String(".") : String(p_root_filter);
+
+	for (int i = 0; i < node_paths.size(); i++) {
+		const String &np = node_paths[i];
+		const bool in_scope = (filter == ".") || (np == filter) || np.begins_with(filter + "/");
+		if (!in_scope) {
+			continue;
+		}
+
+		for (const String &id : node_ext_refs[i]) {
+			r_required_ext_ids.insert(id);
+		}
+
+		// Expand sub_resource references transitively: a sub_resource used by
+		// an in-scope node may itself reference ext_resources (or further
+		// sub_resources, which may reference more ext_resources, etc).
+		List<String> to_visit;
+		for (const String &id : node_sub_refs[i]) {
+			to_visit.push_back(id);
+		}
+		HashSet<String> visited;
+		while (!to_visit.is_empty()) {
+			String sub_id = to_visit.front()->get();
+			to_visit.pop_front();
+			if (visited.has(sub_id)) {
+				continue;
+			}
+			visited.insert(sub_id);
+
+			if (sub_resource_ext_refs.has(sub_id)) {
+				for (const String &id : sub_resource_ext_refs[sub_id]) {
+					r_required_ext_ids.insert(id);
+				}
+			}
+			if (sub_resource_sub_refs.has(sub_id)) {
+				for (const String &id : sub_resource_sub_refs[sub_id]) {
+					to_visit.push_back(id);
+				}
 			}
 		}
 	}
@@ -1990,13 +2254,24 @@ Error ResourceFormatSaverTextInstance::save(const String &p_path, const Ref<Reso
 	for (int i = 0; i < sorted_er.size(); i++) {
 		String p = sorted_er[i].resource->get_path();
 
-		String s = "[ext_resource type=\"" + sorted_er[i].resource->get_save_class() + "\"";
+		// A PackedScene referencing a sub-tree of another scene has a synthetic
+		// path "res://src.tscn@subroot=A/B".  Split it back into path + subroot=.
+		String subroot;
+		ResourceFormatLoaderSubScene::split_sub_path(p, p, subroot);
+
+		// A sub-scene reference is always saved as a PackedScene.
+		const String save_class = !subroot.is_empty() ? String("PackedScene") : sorted_er[i].resource->get_save_class();
+		String s = "[ext_resource type=\"" + save_class + "\"";
 
 		ResourceUID::ID uid = ResourceSaver::get_resource_id_for_path(p, false);
 		if (uid != ResourceUID::INVALID_ID) {
 			s += " uid=\"" + ResourceUID::get_singleton()->id_to_text(uid) + "\"";
 		}
-		s += " path=\"" + p + "\" id=\"" + sorted_er[i].id + "\"]\n";
+		s += " path=\"" + p + "\"";
+		if (!subroot.is_empty()) {
+			s += " subroot=\"" + subroot + "\"";
+		}
+		s += " id=\"" + sorted_er[i].id + "\"]\n";
 		f->store_string(s); // Bundled.
 	}
 

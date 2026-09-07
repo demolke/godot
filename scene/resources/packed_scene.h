@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/io/resource.h"
+#include "core/io/resource_loader.h"
 #include "scene/main/node.h"
 
 class PackedScene;
@@ -214,6 +215,11 @@ public:
 	Ref<Resource> get_sub_resource(const String &p_path);
 	Vector<Ref<Resource>> get_sub_resources();
 
+	// Builds a new, standalone SceneState containing only the sub-tree rooted at
+	// p_root (which becomes the new root). Everything outside the sub-tree is
+	// discarded. Used to reference a node of another scene as a PackedScene.
+	Ref<SceneState> get_subtree_state(const NodePath &p_root) const;
+
 	//build API
 
 	int add_name(const StringName &p_name);
@@ -292,7 +298,60 @@ public:
 #endif
 	Ref<SceneState> get_state() const;
 
+	// Builds a lightweight PackedScene that references only the sub-tree rooted
+	// at p_node of p_source. The wrapper holds a re-rooted SceneState and is
+	// registered under p_path (of the form "res://src.tscn@root=A/B") so it can
+	// be cached, re-loaded, and round-tripped back to an ext_resource subroot=.
+	static Ref<PackedScene> create_sub_reference(const Ref<PackedScene> &p_source, const NodePath &p_node, const String &p_path);
+
+	// The wrapper holds a re-rooted SceneState; it has no resource path of its
+	// own (there is no synthetic path scheme — subroot scoping is carried as a
+	// plain field on the ext_resource that references it, see
+	// ResourceLoaderText::ExtResource::subroot and ResourceLoaderBinary::
+	// ExtResource::subroot). get_root_source_path()/get_root_node_path() let the
+	// savers recover what to write back out for such a wrapper.
+	static Ref<PackedScene> from_root(const Ref<PackedScene> &p_source, const NodePath &p_root_path);
+
+	Node *instantiate_root(const NodePath &p_root_path, GenEditState p_edit_state = GEN_EDIT_STATE_DISABLED) const;
+
+	bool is_root_reference() const { return !root_source_path.is_empty(); }
+	String get_root_source_path() const { return root_source_path; }
+	NodePath get_root_node_path() const { return root_node_path; }
+
+	static void _register_root_scoped_instance(ObjectID p_node_id, const Ref<PackedScene> &p_source);
+	static Ref<PackedScene> _take_root_scoped_instance(ObjectID p_node_id);
+
 	PackedScene();
+
+private:
+	String root_source_path;
+	NodePath root_node_path;
+	static HashMap<ObjectID, Ref<PackedScene>> root_scoped_instances;
 };
 
 VARIANT_ENUM_CAST(PackedScene::GenEditState)
+
+// Resolves synthetic "res://src.tscn@root=A/B" paths to a PackedScene that
+// represents only the referenced sub-tree of the source scene. This lets a
+// node of one scene be instantiated/saved as an external PackedScene reference.
+class ResourceFormatLoaderSubScene : public ResourceFormatLoader {
+public:
+	static const char *SUB_SCENE_SEPARATOR;
+
+	// Builds a synthetic path from a source scene path and a node path.
+	// make_sub_path("res://src.tscn", "A/B") → "res://src.tscn@root=A/B"
+	// make_sub_path("res://src.tscn", "")    → "res://src.tscn"  (no suffix)
+	static String make_sub_path(const String &p_scene_path, const String &p_node_path);
+
+	// Splits a synthetic path back into its components.
+	// split_sub_path("res://src.tscn@root=A/B", scene, node) → scene="res://src.tscn", node="A/B"
+	// split_sub_path("res://src.tscn", scene, node)          → scene="res://src.tscn", node=""
+	static void split_sub_path(const String &p_path, String &r_scene_path, String &r_node_path);
+
+	virtual Ref<Resource> load(const String &p_path, const String &p_original_path = "", Error *r_error = nullptr, bool p_use_sub_threads = false, float *r_progress = nullptr, CacheMode p_cache_mode = CACHE_MODE_REUSE) override;
+	virtual void get_recognized_extensions(List<String> *p_extensions) const override;
+	virtual bool recognize_path(const String &p_path, const String &p_for_type = String()) const override;
+	virtual bool handles_type(const String &p_type) const override;
+	virtual String get_resource_type(const String &p_path) const override;
+	virtual void get_dependencies(const String &p_path, List<String> *p_dependencies, bool p_add_types = false) override;
+};

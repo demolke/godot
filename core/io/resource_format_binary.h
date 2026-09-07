@@ -33,7 +33,10 @@
 #include "core/io/file_access.h"
 #include "core/io/resource_loader.h"
 #include "core/io/resource_saver.h"
+#include "core/string/node_path.h"
 #include "core/templates/rb_map.h"
+
+class PackedScene;
 
 class ResourceLoaderBinary {
 	bool translation_remapped = false;
@@ -60,6 +63,7 @@ class ResourceLoaderBinary {
 		String path;
 		String type;
 		ResourceUID::ID uid = ResourceUID::INVALID_ID;
+		String subroot; // Node path ("A/B") scoping this to a sub-tree; empty for normal refs.
 		Ref<ResourceLoader::LoadToken> load_token;
 	};
 

@@ -32,8 +32,15 @@
 
 TEST_FORCE_LINK(test_packed_scene)
 
+#include "core/io/file_access.h"
+#include "core/io/resource_loader.h"
+#include "core/io/resource_saver.h"
 #include "core/object/callable_mp.h"
+#include "scene/3d/mesh_instance_3d.h"
+#include "scene/resources/3d/primitive_meshes.h"
 #include "scene/resources/packed_scene.h"
+
+#include "tests/test_utils.h"
 
 namespace TestPackedScene {
 
@@ -280,6 +287,248 @@ TEST_CASE("[PackedScene] Recreate State") {
 	CHECK(state->get_node_count() == 0); // Since the state was recreated, it should be empty.
 
 	memdelete(scene);
+}
+
+TEST_CASE("[PackedScene] Sub-tree reference via subroot= (text format)") {
+	// Source scene: Source -> Branch -> Leaf.
+	Node3D *source_root = memnew(Node3D);
+	source_root->set_name("Source");
+	Node3D *branch = memnew(Node3D);
+	branch->set_name("Branch");
+	Node3D *leaf = memnew(Node3D);
+	leaf->set_name("Leaf");
+	source_root->add_child(branch);
+	branch->set_owner(source_root);
+	branch->add_child(leaf);
+	leaf->set_owner(source_root);
+
+	Ref<PackedScene> source_packed;
+	source_packed.instantiate();
+	REQUIRE(source_packed->pack(source_root) == OK);
+
+	const String source_path = TestUtils::get_temp_path("subtree_source.tscn");
+	REQUIRE(ResourceSaver::save(source_packed, source_path) == OK);
+
+	Ref<PackedScene> source_loaded = ResourceLoader::load(source_path, "PackedScene", ResourceFormatLoader::CACHE_MODE_REPLACE);
+	REQUIRE(source_loaded.is_valid());
+
+	SUBCASE("get_subtree_state re-roots at the requested node") {
+		Ref<SceneState> sub = source_loaded->get_state()->get_subtree_state(NodePath("Branch"));
+		REQUIRE(sub.is_valid());
+		REQUIRE(sub->get_node_count() == 2);
+		CHECK(String(sub->get_node_name(0)) == "Branch");
+		CHECK(String(sub->get_node_path(0)) == ".");
+		CHECK(String(sub->get_node_name(1)) == "Leaf");
+	}
+
+	const String synthetic = source_path + ResourceFormatLoaderSubScene::SUB_SCENE_SEPARATOR + "Branch";
+
+	SUBCASE("Synthetic @subroot= path loads a re-rooted PackedScene") {
+		Ref<PackedScene> wrapper = ResourceLoader::load(synthetic, "PackedScene");
+		REQUIRE(wrapper.is_valid());
+		Node *inst = wrapper->instantiate();
+		REQUIRE(inst != nullptr);
+		CHECK(inst->get_name() == StringName("Branch"));
+		REQUIRE(inst->get_child_count() == 1);
+		CHECK(inst->get_child(0)->get_name() == StringName("Leaf"));
+		memdelete(inst);
+	}
+
+	// Host scene instances the sub-tree, then is saved.
+	Ref<PackedScene> wrapper = ResourceLoader::load(synthetic, "PackedScene");
+	REQUIRE(wrapper.is_valid());
+	Node *branch_instance = wrapper->instantiate(PackedScene::GEN_EDIT_STATE_INSTANCE);
+	REQUIRE(branch_instance != nullptr);
+
+	Node3D *host_root = memnew(Node3D);
+	host_root->set_name("Host");
+	host_root->add_child(branch_instance);
+	branch_instance->set_owner(host_root);
+
+	Ref<PackedScene> host_packed;
+	host_packed.instantiate();
+	REQUIRE(host_packed->pack(host_root) == OK);
+
+	const String host_path = TestUtils::get_temp_path("subtree_host.tscn");
+	REQUIRE(ResourceSaver::save(host_packed, host_path) == OK);
+
+	SUBCASE("Saver writes a subroot= PackedScene ext_resource") {
+		Ref<FileAccess> f = FileAccess::open(host_path, FileAccess::READ);
+		REQUIRE(f.is_valid());
+		const String text = f->get_as_text();
+		CHECK(text.contains("[ext_resource"));
+		CHECK(text.contains("type=\"PackedScene\""));
+		CHECK(text.contains("subroot=\"Branch\""));
+		CHECK(text.contains(vformat("path=\"%s\"", source_path)));
+		// The synthetic "@root=" path must never be written verbatim.
+		CHECK_FALSE(text.contains("@root="));
+	}
+
+	SUBCASE("Loading the host re-instantiates the sub-tree") {
+		Ref<PackedScene> host_loaded = ResourceLoader::load(host_path, "PackedScene", ResourceFormatLoader::CACHE_MODE_REPLACE);
+		REQUIRE(host_loaded.is_valid());
+		Node *inst = host_loaded->instantiate();
+		REQUIRE(inst != nullptr);
+		Node *b = inst->get_node_or_null(NodePath("Branch"));
+		REQUIRE(b != nullptr);
+		REQUIRE(b->get_child_count() == 1);
+		CHECK(b->get_node_or_null(NodePath("Leaf")) != nullptr);
+		memdelete(inst);
+	}
+
+	memdelete(source_root);
+	memdelete(host_root);
+}
+
+TEST_CASE("[PackedScene] Sub-tree reference survives text<->binary conversion") {
+	// Source scene: Source -> Branch -> Leaf, saved as text.
+	Node3D *source_root = memnew(Node3D);
+	source_root->set_name("Source");
+	Node3D *branch = memnew(Node3D);
+	branch->set_name("Branch");
+	Node3D *leaf = memnew(Node3D);
+	leaf->set_name("Leaf");
+	source_root->add_child(branch);
+	branch->set_owner(source_root);
+	branch->add_child(leaf);
+	leaf->set_owner(source_root);
+
+	Ref<PackedScene> source_packed;
+	source_packed.instantiate();
+	REQUIRE(source_packed->pack(source_root) == OK);
+
+	const String source_path = TestUtils::get_temp_path("xfmt_source.tscn");
+	REQUIRE(ResourceSaver::save(source_packed, source_path) == OK);
+
+	// Build a host that instances the Branch sub-tree and save it as TEXT.
+	const String synthetic = source_path + ResourceFormatLoaderSubScene::SUB_SCENE_SEPARATOR + "Branch";
+	Ref<PackedScene> wrapper = ResourceLoader::load(synthetic, "PackedScene");
+	REQUIRE(wrapper.is_valid());
+	Node *branch_instance = wrapper->instantiate(PackedScene::GEN_EDIT_STATE_INSTANCE);
+	REQUIRE(branch_instance != nullptr);
+
+	Node3D *host_root = memnew(Node3D);
+	host_root->set_name("Host");
+	host_root->add_child(branch_instance);
+	branch_instance->set_owner(host_root);
+
+	Ref<PackedScene> host_packed;
+	host_packed.instantiate();
+	REQUIRE(host_packed->pack(host_root) == OK);
+
+	const String host_tscn = TestUtils::get_temp_path("xfmt_host.tscn");
+	REQUIRE(ResourceSaver::save(host_packed, host_tscn) == OK);
+
+	SUBCASE("text host -> binary -> text round-trips the subroot= reference") {
+		// Load the text host and re-save it as a BINARY .scn.
+		Ref<PackedScene> from_tscn = ResourceLoader::load(host_tscn, "PackedScene", ResourceFormatLoader::CACHE_MODE_REPLACE);
+		REQUIRE(from_tscn.is_valid());
+		const String host_scn = TestUtils::get_temp_path("xfmt_host.scn");
+		REQUIRE(ResourceSaver::save(from_tscn, host_scn) == OK);
+
+		// The binary scene must still instantiate the sub-tree.
+		Ref<PackedScene> from_scn = ResourceLoader::load(host_scn, "PackedScene", ResourceFormatLoader::CACHE_MODE_REPLACE);
+		REQUIRE(from_scn.is_valid());
+		Node *inst = from_scn->instantiate();
+		REQUIRE(inst != nullptr);
+		Node *b = inst->get_node_or_null(NodePath("Branch"));
+		REQUIRE(b != nullptr);
+		REQUIRE(b->get_child_count() == 1);
+		CHECK(b->get_node_or_null(NodePath("Leaf")) != nullptr);
+		memdelete(inst);
+
+		// Convert the binary scene back to TEXT and confirm the clean subroot= form
+		// is written (and the synthetic "@root=" path never leaks to disk).
+		const String host_tscn2 = TestUtils::get_temp_path("xfmt_host2.tscn");
+		REQUIRE(ResourceSaver::save(from_scn, host_tscn2) == OK);
+		Ref<FileAccess> f = FileAccess::open(host_tscn2, FileAccess::READ);
+		REQUIRE(f.is_valid());
+		const String text = f->get_as_text();
+		CHECK(text.contains("subroot=\"Branch\""));
+		CHECK(text.contains(vformat("path=\"%s\"", source_path)));
+		CHECK_FALSE(text.contains("@root="));
+	}
+
+	SUBCASE("binary host reports the source scene (not the synthetic path) as a dependency") {
+		// In the binary format the node locator is stored separately from the
+		// source path, so dependency tracking sees the bare source scene. This is
+		// what lets the source be relocated/renamed by path or UID without the
+		// "@root=" locator corrupting reconstruction.
+		Ref<PackedScene> from_tscn = ResourceLoader::load(host_tscn, "PackedScene", ResourceFormatLoader::CACHE_MODE_REPLACE);
+		REQUIRE(from_tscn.is_valid());
+		const String host_scn_dep = TestUtils::get_temp_path("xfmt_host_dep.scn");
+		REQUIRE(ResourceSaver::save(from_tscn, host_scn_dep) == OK);
+
+		List<String> deps;
+		ResourceLoader::get_dependencies(host_scn_dep, &deps);
+		bool found_source = false;
+		for (const String &dep : deps) {
+			// The dependency is reported as "type::path" (and never carries the
+			// synthetic "@root=" locator).
+			CHECK_FALSE(dep.contains("@root="));
+			if (dep.contains(source_path)) {
+				found_source = true;
+			}
+		}
+		CHECK(found_source);
+	}
+
+	memdelete(source_root);
+	memdelete(host_root);
+}
+
+TEST_CASE("[PackedScene] ExtResource subroot backward compat v6") {
+	const String v6_path = "res://tests/scene/test_packed_scene_v6.scn";
+	REQUIRE(FileAccess::exists(v6_path));
+	Ref<PackedScene> ps = ResourceLoader::load(v6_path, "PackedScene");
+	REQUIRE(ps.is_valid());
+	CHECK(ps->get_state().is_valid());
+}
+
+TEST_CASE("[PackedScene] Subroot pruning validates only subroot node present") {
+	// Create a PackedScene with two child nodes.
+	Ref<PackedScene> src = memnew(PackedScene);
+	Node *root = memnew(Node3D);
+	root->set_name("Root");
+	Node *keep = memnew(Node3D);
+	keep->set_name("Keep");
+	Node *drop = memnew(Node3D);
+	drop->set_name("Drop");
+	root->add_child(keep);
+	root->add_child(drop);
+	src->pack(root);
+
+	const String src_path = TestUtils::get_temp_path("subroot_src.scn");
+	REQUIRE(ResourceSaver::save(src, src_path) == OK);
+
+	// Load via SubScene with subroot="Keep"
+	const String sub_path = ResourceFormatLoaderSubScene::make_sub_path(src_path, "Keep");
+	Ref<PackedScene> loaded = ResourceLoader::load(sub_path, "PackedScene");
+	REQUIRE(loaded.is_valid());
+
+	Node *inst = loaded->instantiate(PackedScene::GEN_EDIT_STATE_DISABLED);
+	REQUIRE(inst != nullptr);
+	// Only the Keep node should be present under the instance root.
+	CHECK(inst->get_child_count() == 1);
+	CHECK(inst->get_child(0)->get_name() == "Keep");
+
+	memdelete(inst);
+	memdelete(root);
+}
+
+TEST_CASE("[PackedScene] Subroot pruning from v6 file") {
+	const String v6_path = "res://tests/scene/test_packed_scene_v6_multi.scn";
+	REQUIRE(FileAccess::exists(v6_path));
+	// Load via SubScene with subroot="Keep" on a v6 file.
+	const String sub_path = ResourceFormatLoaderSubScene::make_sub_path(v6_path, "Keep");
+	Ref<PackedScene> loaded = ResourceLoader::load(sub_path, "PackedScene");
+	REQUIRE(loaded.is_valid());
+
+	Node *inst = loaded->instantiate(PackedScene::GEN_EDIT_STATE_DISABLED);
+	REQUIRE(inst != nullptr);
+	// Pruning should still work via the SubScene loader even though the file is v6.
+	CHECK(inst->get_child_count() == 1);
+	CHECK(inst->get_child(0)->get_name() == "Keep");
 }
 
 } // namespace TestPackedScene

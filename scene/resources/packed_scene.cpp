@@ -33,6 +33,7 @@
 #include "core/config/engine.h"
 #include "core/io/file_access.h"
 #include "core/io/missing_resource.h"
+#include "core/io/resource_format_binary.h"
 #include "core/io/resource_loader.h"
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
@@ -44,6 +45,7 @@
 #include "scene/main/instance_placeholder.h"
 #include "scene/main/missing_node.h"
 #include "scene/property_utils.h"
+#include "scene/resources/resource_format_text.h"
 
 #ifndef _2D_DISABLED
 #include "scene/2d/node_2d.h"
@@ -922,8 +924,17 @@ Error SceneState::_parse_node(Node *p_owner, Node *p_node, int p_parent_idx, Has
 			nd.instance = _vm_get_variant(p_node->get_scene_file_path(), variant_map);
 			nd.instance |= FLAG_INSTANCE_IS_PLACEHOLDER;
 		} else {
-			//must instance ourselves
-			Ref<PackedScene> instance = ResourceLoader::load(p_node->get_scene_file_path());
+			// If this instance was built via PackedScene::instantiate_root(),
+			// recover the exact root-scoped wrapper it came from -- reloading
+			// by Node::get_scene_file_path() alone would only give back the
+			// unscoped source scene (the wrapper's path is set to the source's
+			// own path; see PackedScene::from_root()), silently losing the
+			// root= restriction and referencing the whole source instead.
+			Ref<PackedScene> instance = PackedScene::_take_root_scoped_instance(p_node->get_instance_id());
+			if (instance.is_null()) {
+				//must instance ourselves
+				instance = ResourceLoader::load(p_node->get_scene_file_path());
+			}
 			if (instance.is_null()) {
 				return ERR_CANT_OPEN;
 			}
@@ -2366,7 +2377,169 @@ Vector<Ref<Resource>> SceneState::get_sub_resources() {
 	return sub_resources;
 }
 
-//add
+// Normalizes a node path to a comparable form. `get_node_path()` returns "." for
+// the root and "./A/B" for descendants, whereas references are authored as "A/B".
+// This strips the leading "./" while keeping "." for the root node.
+static String _scene_state_node_path_key(const NodePath &p_path) {
+	String s = String(p_path);
+	if (s.begins_with("./")) {
+		return s.substr(2);
+	}
+	return s;
+}
+
+Ref<SceneState> SceneState::get_subtree_state(const NodePath &p_root) const {
+	Ref<SceneState> ss;
+	ss.instantiate();
+
+	const String root_key = _scene_state_node_path_key(p_root);
+
+	// Inherited scenes store their base nodes as TYPE_INSTANTIATED diffs that only
+	// reconstruct against the base scene. Dropping base_scene_idx (as a re-rooted
+	// plain scene must) would leave those nodes unrecoverable, so refuse up front.
+	ERR_FAIL_COND_V_MSG(
+			base_scene_idx >= 0,
+			Ref<SceneState>(),
+			"get_subtree_state: cannot extract a sub-tree from an inherited scene.");
+
+	// Locate the requested node; it becomes the new root.
+	int target = -1;
+	for (int i = 0; i < nodes.size(); i++) {
+		if (_scene_state_node_path_key(get_node_path(i)) == root_key) {
+			target = i;
+			break;
+		}
+	}
+	ERR_FAIL_COND_V_MSG(target < 0, Ref<SceneState>(), vformat("get_subtree_state: node '%s' not found in scene.", root_key));
+
+	// TYPE_INSTANTIATED nodes are override-only entries produced by a parent
+	// scene instance. They have no class or instance of their own, so they
+	// cannot stand alone as a scene root.
+	ERR_FAIL_COND_V_MSG(
+			nodes[target].type == TYPE_INSTANTIATED,
+			Ref<SceneState>(),
+			vformat("get_subtree_state: node '%s' is an override-only node of a nested instance and cannot be used as a sub-tree root.", root_key));
+
+	// Collect the node and all its descendants (every sibling of an included
+	// node is included too, since we keep whole sub-trees).
+	const String prefix = root_key + "/";
+	HashMap<String, int> path_to_new; // normalized source path -> new index
+	Vector<int> included; // new index -> source index
+	for (int i = 0; i < nodes.size(); i++) {
+		const String key = _scene_state_node_path_key(get_node_path(i));
+		if (key == root_key || key.begins_with(prefix)) {
+			path_to_new[key] = included.size();
+			included.push_back(i);
+		}
+	}
+
+	// The name/variant/node-path tables are referenced by index from NodeData,
+	// so copy them wholesale and leave those indices untouched. Only the node,
+	// parent/owner and connection references need remapping.
+	ss->names = names;
+	ss->variants = variants;
+	ss->node_paths = node_paths;
+	ss->id_paths = id_paths;
+	ss->base_scene_idx = -1; // A sub-tree is a plain scene, not an inherited one.
+
+	// Resolves a parent/owner/connection reference (index or path encoded) to a
+	// normalized source path so it can be looked up in the new index map.
+	auto resolve_ref_path = [&](int p_ref) -> String {
+		if (p_ref < 0 || p_ref == NO_PARENT_SAVED) {
+			return String();
+		}
+		if (p_ref & FLAG_ID_IS_PATH) {
+			return _scene_state_node_path_key(node_paths[p_ref & FLAG_MASK]);
+		}
+		return _scene_state_node_path_key(get_node_path(p_ref & FLAG_MASK));
+	};
+
+	for (int ni = 0; ni < included.size(); ni++) {
+		const int oi = included[ni];
+		NodeData nd = nodes[oi]; // Copies properties and groups (their indices stay valid).
+
+		if (ni == 0) {
+			nd.parent = -1;
+			nd.owner = -1;
+			nd.index = -1;
+		} else {
+			HashMap<String, int>::Iterator P = path_to_new.find(resolve_ref_path(nodes[oi].parent));
+			ERR_CONTINUE_MSG(!P, vformat("get_subtree_state: parent of '%s' falls outside the sub-tree.", _scene_state_node_path_key(get_node_path(oi))));
+			nd.parent = P->value;
+
+			// Ownership stays inside the sub-tree; otherwise the new root owns it.
+			HashMap<String, int>::Iterator O = path_to_new.find(resolve_ref_path(nodes[oi].owner));
+			nd.owner = O ? O->value : 0;
+		}
+
+		ss->nodes.push_back(nd);
+		ss->ids.push_back(oi < ids.size() ? ids[oi] : (int32_t)Node::UNIQUE_SCENE_ID_UNASSIGNED);
+	}
+
+	// Keep only connections whose endpoints are both inside the sub-tree.
+	for (const ConnectionData &c : connections) {
+		HashMap<String, int>::Iterator F = path_to_new.find(resolve_ref_path(c.from));
+		HashMap<String, int>::Iterator T = path_to_new.find(resolve_ref_path(c.to));
+		if (!F || !T) {
+			continue;
+		}
+		ConnectionData nc = c;
+		nc.from = F->value;
+		nc.to = T->value;
+		ss->connections.push_back(nc);
+	}
+
+	// Editable instances under the new root, rebased to it.
+	// Also include the root itself when it was marked editable in the source scene.
+	for (const NodePath &ei : editable_instances) {
+		const String k = _scene_state_node_path_key(ei);
+		if (k == root_key) {
+			ss->editable_instances.push_back(NodePath("."));
+		} else if (k.begins_with(prefix)) {
+			ss->editable_instances.push_back(NodePath(k.substr(prefix.length())));
+		}
+	}
+
+	// Warn about NodePath properties that may reference nodes outside the
+	// extracted sub-tree. Two categories are checked:
+	//   1. Deferred node references (FLAG_PATH_PROPERTY_IS_NODE) — stored as a
+	//      NodePath, resolved to an Object* at instantiation time.
+	//   2. Plain NodePath-typed properties (e.g. AnimationMixer.root_node,
+	//      AnimationTree.anim_player) — stored as Variant::NODE_PATH and
+	//      interpreted at runtime by the node itself.
+	// Both will silently fail to resolve if the path escapes the sub-tree.
+	//
+	// NOTE: Resource properties inside variants (e.g. Animation objects) are
+	// shared by reference between the original scene and the extracted sub-tree.
+	// This is intentional — the sub-tree is a linked view of the source, so
+	// animation edits in the source propagate to instances. Callers that need
+	// fully independent resources must deep-copy after extraction.
+	for (int ni = 0; ni < included.size(); ni++) {
+		const int oi = included[ni];
+		for (const NodeData::Property &prop : nodes[oi].properties) {
+			if (prop.value < 0 || prop.value >= (int)variants.size()) {
+				continue;
+			}
+			String ref_str;
+			if (prop.name & FLAG_PATH_PROPERTY_IS_NODE) {
+				ref_str = String(NodePath(variants[prop.value]));
+			} else if (variants[prop.value].get_type() == Variant::NODE_PATH) {
+				ref_str = String(NodePath(variants[prop.value]));
+			} else {
+				continue;
+			}
+			// Paths that ascend (via ..) or are absolute (/root/...) may land
+			// outside the sub-tree and will not resolve correctly at runtime.
+			if (ref_str.contains("..") || ref_str.begins_with("/")) {
+				const StringName prop_name = names[prop.name & FLAG_PROP_NAME_MASK];
+				WARN_PRINT(vformat("get_subtree_state: node '%s' has NodePath property '%s' = '%s' that may reference a node outside the extracted sub-tree and will not resolve correctly.",
+						_scene_state_node_path_key(get_node_path(oi)), prop_name, ref_str));
+			}
+		}
+	}
+
+	return ss;
+}
 
 int SceneState::add_name(const StringName &p_name) {
 	names.push_back(p_name);
@@ -2669,6 +2842,69 @@ Ref<SceneState> PackedScene::get_state() const {
 	return state;
 }
 
+Ref<PackedScene> PackedScene::from_root(const Ref<PackedScene> &p_source, const NodePath &p_root_path) {
+	ERR_FAIL_COND_V(p_source.is_null() || p_source->get_state().is_null(), Ref<PackedScene>());
+	Ref<PackedScene> wrapper;
+	wrapper.instantiate();
+	Ref<SceneState> sub = p_source->get_state()->get_subtree_state(p_root_path);
+	if (sub.is_null() || !sub->can_instantiate()) {
+		return Ref<PackedScene>();
+	}
+	wrapper->replace_state(sub);
+	wrapper->root_source_path = p_source->get_path();
+	wrapper->root_node_path = p_root_path;
+	return wrapper;
+}
+
+Ref<PackedScene> PackedScene::create_sub_reference(const Ref<PackedScene> &p_source, const NodePath &p_node, const String &p_path) {
+	ERR_FAIL_COND_V(p_source.is_null() || p_source->get_state().is_null(), Ref<PackedScene>());
+
+	// Reuse an existing wrapper for this exact source+node if one is cached.
+	Ref<PackedScene> existing = ResourceCache::get_ref(p_path);
+	if (existing.is_valid()) {
+		return existing;
+	}
+
+	Ref<SceneState> sub = p_source->get_state()->get_subtree_state(p_node);
+	ERR_FAIL_COND_V(sub.is_null() || !sub->can_instantiate(), Ref<PackedScene>());
+
+	Ref<PackedScene> wrapper;
+	wrapper.instantiate();
+	wrapper->replace_state(sub);
+	wrapper->set_path(p_path, true);
+	return wrapper;
+}
+
+HashMap<ObjectID, Ref<PackedScene>> PackedScene::root_scoped_instances;
+
+void PackedScene::_register_root_scoped_instance(ObjectID p_node_id, const Ref<PackedScene> &p_source) {
+	root_scoped_instances[p_node_id] = p_source;
+}
+
+Ref<PackedScene> PackedScene::_take_root_scoped_instance(ObjectID p_node_id) {
+	HashMap<ObjectID, Ref<PackedScene>>::Iterator E = root_scoped_instances.find(p_node_id);
+	if (!E) {
+		return Ref<PackedScene>();
+	}
+	Ref<PackedScene> found = E->value;
+	root_scoped_instances.remove(E);
+	return found;
+}
+
+Node *PackedScene::instantiate_root(const NodePath &p_root_path, GenEditState p_edit_state) const {
+	Ref<PackedScene> wrapper = from_root(Ref<PackedScene>(const_cast<PackedScene *>(this)), p_root_path);
+	ERR_FAIL_COND_V(wrapper.is_null(), nullptr);
+	Node *node = wrapper->instantiate(p_edit_state);
+	if (node && p_edit_state != GEN_EDIT_STATE_DISABLED) {
+		// Let a later save recover this exact root-scoped wrapper for this
+		// node (see SceneState::_parse_node()'s instance resolution), instead
+		// of silently losing the root= restriction when the saver falls back
+		// to reloading Node::get_scene_file_path() by its plain path.
+		_register_root_scoped_instance(node->get_instance_id(), wrapper);
+	}
+	return node;
+}
+
 void PackedScene::set_path(const String &p_path, bool p_take_over) {
 	state->set_path(p_path);
 	Resource::set_path(p_path, p_take_over);
@@ -2690,6 +2926,13 @@ void PackedScene::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("_get_bundled_scene"), &PackedScene::_get_bundled_scene);
 	ClassDB::bind_method(D_METHOD("get_state"), &PackedScene::get_state);
 
+	// root= sub-tree references (see resource_format_text.h/resource_format_binary.h).
+	ClassDB::bind_static_method("PackedScene", D_METHOD("from_root", "source", "root_path"), &PackedScene::from_root);
+	ClassDB::bind_method(D_METHOD("instantiate_root", "root_path", "edit_state"), &PackedScene::instantiate_root, DEFVAL(GEN_EDIT_STATE_DISABLED));
+	ClassDB::bind_method(D_METHOD("is_root_reference"), &PackedScene::is_root_reference);
+	ClassDB::bind_method(D_METHOD("get_root_source_path"), &PackedScene::get_root_source_path);
+	ClassDB::bind_method(D_METHOD("get_root_node_path"), &PackedScene::get_root_node_path);
+
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "_bundled", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE | PROPERTY_USAGE_INTERNAL), "_set_bundled_scene", "_get_bundled_scene");
 
 	BIND_ENUM_CONSTANT(GEN_EDIT_STATE_DISABLED);
@@ -2700,4 +2943,102 @@ void PackedScene::_bind_methods() {
 
 PackedScene::PackedScene() {
 	state.instantiate();
+}
+
+/////////////////////////////////////
+
+const char *ResourceFormatLoaderSubScene::SUB_SCENE_SEPARATOR = "@root=";
+
+String ResourceFormatLoaderSubScene::make_sub_path(const String &p_scene_path, const String &p_node_path) {
+	if (p_node_path.is_empty() || p_node_path == ".") {
+		return p_scene_path;
+	}
+	return p_scene_path + SUB_SCENE_SEPARATOR + p_node_path;
+}
+
+void ResourceFormatLoaderSubScene::split_sub_path(const String &p_path, String &r_scene_path, String &r_node_path) {
+	const int sep = p_path.find(SUB_SCENE_SEPARATOR);
+	if (sep < 0) {
+		// Capture before writing in case p_path and r_scene_path alias.
+		const String full = p_path;
+		r_scene_path = full;
+		r_node_path = String();
+	} else {
+		// Capture both sub-strings before writing either output (aliasing guard).
+		const String scene = p_path.left(sep);
+		const String node = p_path.substr(sep + (int)strlen(SUB_SCENE_SEPARATOR));
+		r_scene_path = scene;
+		r_node_path = node;
+	}
+}
+
+Ref<Resource> ResourceFormatLoaderSubScene::load(const String &p_path, const String &p_original_path, Error *r_error, bool p_use_sub_threads, float *r_progress, CacheMode p_cache_mode) {
+	if (r_error) {
+		*r_error = ERR_FILE_UNRECOGNIZED;
+	}
+	if (!recognize_path(p_path)) {
+		return Ref<Resource>();
+	}
+
+	String source_path, node_path;
+	split_sub_path(p_path, source_path, node_path);
+	const NodePath node = NodePath(node_path);
+
+	Error err = OK;
+	Ref<PackedScene> source = ResourceLoader::load(source_path, "PackedScene", p_cache_mode, &err);
+	if (source.is_null()) {
+		if (r_error) {
+			*r_error = err != OK ? err : ERR_CANT_OPEN;
+		}
+		return Ref<Resource>();
+	}
+
+	Ref<PackedScene> wrapper = PackedScene::create_sub_reference(source, node, p_path);
+	if (wrapper.is_null()) {
+		if (r_error) {
+			*r_error = ERR_CANT_CREATE;
+		}
+		return Ref<Resource>();
+	}
+
+	if (r_error) {
+		*r_error = OK;
+	}
+	return wrapper;
+}
+
+void ResourceFormatLoaderSubScene::get_recognized_extensions(List<String> *p_extensions) const {
+	// Sub-scene references have no file extension of their own; they are only
+	// recognized by the "@root=" marker embedded in the path.
+}
+
+bool ResourceFormatLoaderSubScene::recognize_path(const String &p_path, const String &p_for_type) const {
+	// The separator must appear after a non-empty source path, and the source
+	// path itself must not contain another separator (no recursive nesting).
+	const int sep = p_path.find(SUB_SCENE_SEPARATOR);
+	if (sep <= 0) {
+		return false;
+	}
+	const String source = p_path.left(sep);
+	return !source.contains(SUB_SCENE_SEPARATOR);
+}
+
+bool ResourceFormatLoaderSubScene::handles_type(const String &p_type) const {
+	return p_type == "PackedScene" || p_type == "Resource";
+}
+
+String ResourceFormatLoaderSubScene::get_resource_type(const String &p_path) const {
+	return recognize_path(p_path) ? String("PackedScene") : String();
+}
+
+void ResourceFormatLoaderSubScene::get_dependencies(const String &p_path, List<String> *p_dependencies, bool p_add_types) {
+	if (!p_dependencies || !recognize_path(p_path)) {
+		return;
+	}
+	String source_path, node_path;
+	split_sub_path(p_path, source_path, node_path);
+	if (p_add_types) {
+		source_path += "::PackedScene";
+	}
+	p_dependencies->push_back(source_path);
 }
