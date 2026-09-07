@@ -144,6 +144,7 @@ Error ResourceLoaderText::_parse_ext_resource(VariantParser::Stream *p_stream, R
 
 		String path = ext_resources[id].path;
 		String type = ext_resources[id].type;
+		const String &node = ext_resources[id].node;
 		Ref<ResourceLoader::LoadToken> &load_token = ext_resources[id].load_token;
 
 		if (load_token.is_valid()) { // If not valid, it's OK since then we know this load accepts broken dependencies.
@@ -158,6 +159,28 @@ Error ResourceLoaderText::_parse_ext_resource(VariantParser::Stream *p_stream, R
 					} else {
 						ResourceLoader::notify_dependency_error(local_path, path, type);
 					}
+				}
+			} else if (!node.is_empty()) {
+				// node= references the sub-tree of another scene as a PackedScene.
+				// Only PackedScene is supported for now.
+				Ref<PackedScene> scene = res;
+				if (node.contains(ResourceFormatLoaderSubScene::SUB_SCENE_SEPARATOR)) {
+					error_text = vformat("[ext_resource] node= reference '%s' must not contain '%s'.", node, ResourceFormatLoaderSubScene::SUB_SCENE_SEPARATOR);
+				} else if (!scene.is_valid() || !scene->get_state().is_valid()) {
+					error_text = "[ext_resource] node= reference requires a PackedScene at: " + path;
+				} else {
+					const String synthetic = ResourceFormatLoaderSubScene::make_sub_path(path, node);
+					r_res = PackedScene::create_sub_reference(scene, NodePath(node), synthetic);
+					if (r_res.is_null()) {
+						error_text = vformat("[ext_resource] could not extract sub-scene '%s' from '%s'", node, path);
+					}
+				}
+				if (r_res.is_null() && ResourceLoader::get_abort_on_missing_resources()) {
+					error = ERR_FILE_MISSING_DEPENDENCIES;
+					ERR_PRINT(_get_error_string());
+					err = error;
+				} else if (r_res.is_null()) {
+					ResourceLoader::notify_dependency_error(local_path, path, type);
 				}
 			} else {
 				r_res = res;
@@ -504,7 +527,13 @@ Error ResourceLoaderText::load() {
 
 		ext_resources[id].path = path;
 		ext_resources[id].type = type;
-		ext_resources[id].load_token = ResourceLoader::_load_start(path, type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
+		if (next_tag.fields.has("node")) {
+			ext_resources[id].node = next_tag.fields["node"];
+		}
+		// A node reference loads the whole scene at `path`, then extracts the
+		// sub-resource held by the node. PackedScene is forced as the load type.
+		const String load_type = ext_resources[id].node.is_empty() ? type : String("PackedScene");
+		ext_resources[id].load_token = ResourceLoader::_load_start(path, load_type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
 		if (ext_resources[id].load_token.is_null()) {
 			if (ResourceLoader::get_abort_on_missing_resources()) {
 				error = ERR_FILE_CORRUPT;
@@ -1072,7 +1101,11 @@ Error ResourceLoaderText::rename_dependencies(Ref<FileAccess> p_f, const String 
 			if (uid != ResourceUID::INVALID_ID) {
 				s += " uid=\"" + ResourceUID::get_singleton()->id_to_text(uid) + "\"";
 			}
-			s += " path=\"" + path + "\" id=\"" + id + "\"]";
+			s += " path=\"" + path + "\"";
+			if (next_tag.fields.has("node")) {
+				s += " node=\"" + String(next_tag.fields["node"]) + "\"";
+			}
+			s += " id=\"" + id + "\"]";
 			fw->store_line(s); // Bundled.
 
 			tag_end = f->get_position();
@@ -1990,13 +2023,24 @@ Error ResourceFormatSaverTextInstance::save(const String &p_path, const Ref<Reso
 	for (int i = 0; i < sorted_er.size(); i++) {
 		String p = sorted_er[i].resource->get_path();
 
-		String s = "[ext_resource type=\"" + sorted_er[i].resource->get_save_class() + "\"";
+		// A PackedScene referencing a sub-tree of another scene has a synthetic
+		// path "res://src.tscn@node=A/B".  Split it back into path + node=.
+		String node_locator;
+		ResourceFormatLoaderSubScene::split_sub_path(p, p, node_locator);
+
+		// A sub-scene reference is always saved as a PackedScene.
+		const String save_class = !node_locator.is_empty() ? String("PackedScene") : sorted_er[i].resource->get_save_class();
+		String s = "[ext_resource type=\"" + save_class + "\"";
 
 		ResourceUID::ID uid = ResourceSaver::get_resource_id_for_path(p, false);
 		if (uid != ResourceUID::INVALID_ID) {
 			s += " uid=\"" + ResourceUID::get_singleton()->id_to_text(uid) + "\"";
 		}
-		s += " path=\"" + p + "\" id=\"" + sorted_er[i].id + "\"]\n";
+		s += " path=\"" + p + "\"";
+		if (!node_locator.is_empty()) {
+			s += " node=\"" + node_locator + "\"";
+		}
+		s += " id=\"" + sorted_er[i].id + "\"]\n";
 		f->store_string(s); // Bundled.
 	}
 

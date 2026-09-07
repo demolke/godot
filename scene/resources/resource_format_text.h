@@ -62,6 +62,9 @@ private:
 		Ref<ResourceLoader::LoadToken> load_token;
 		String path;
 		String type;
+		// When set, the reference targets the sub-tree of the PackedScene at
+		// `path` rooted at the node `node`, instead of the whole scene.
+		String node;
 	};
 
 	bool is_scene = false;

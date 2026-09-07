@@ -60,6 +60,7 @@ class ResourceLoaderBinary {
 		String path;
 		String type;
 		ResourceUID::ID uid = ResourceUID::INVALID_ID;
+		String node_locator; // Sub-tree reference locator ("A/B"); empty for normal refs.
 		Ref<ResourceLoader::LoadToken> load_token;
 	};
 

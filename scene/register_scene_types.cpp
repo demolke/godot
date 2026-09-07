@@ -382,6 +382,7 @@
 
 static Ref<ResourceFormatSaverText> resource_saver_text;
 static Ref<ResourceFormatLoaderText> resource_loader_text;
+static Ref<ResourceFormatLoaderSubScene> resource_loader_sub_scene;
 
 static Ref<ResourceFormatLoaderCompressedTexture2D> resource_loader_compressed_texture;
 static Ref<ResourceFormatLoaderStreamedTexture2D> resource_loader_streamed_texture;
@@ -428,6 +429,11 @@ void register_scene_types() {
 
 	resource_loader_text.instantiate();
 	ResourceLoader::add_resource_format_loader(resource_loader_text, true);
+
+	// Registered at the front so synthetic "@node=" sub-scene paths are claimed
+	// before the text loader (which would not recognize their extension).
+	resource_loader_sub_scene.instantiate();
+	ResourceLoader::add_resource_format_loader(resource_loader_sub_scene, true);
 
 	if constexpr (GD_IS_CLASS_ENABLED(Shader)) {
 		resource_saver_shader.instantiate();
@@ -1372,6 +1378,9 @@ void unregister_scene_types() {
 
 	ResourceSaver::remove_resource_format_saver(resource_saver_text);
 	resource_saver_text.unref();
+
+	ResourceLoader::remove_resource_format_loader(resource_loader_sub_scene);
+	resource_loader_sub_scene.unref();
 
 	ResourceLoader::remove_resource_format_loader(resource_loader_text);
 	resource_loader_text.unref();
