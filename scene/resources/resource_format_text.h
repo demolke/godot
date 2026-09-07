@@ -62,6 +62,9 @@ private:
 		Ref<ResourceLoader::LoadToken> load_token;
 		String path;
 		String type;
+		// When set, the reference targets the sub-tree of the PackedScene at
+		// `path` rooted at the node `subroot`, instead of the whole scene.
+		String subroot;
 	};
 
 	bool is_scene = false;
@@ -93,6 +96,12 @@ private:
 
 	HashMap<String, String> remaps;
 
+	// ext_resource ids to NOT _load_start(), because a prior structural scan
+	// (scan_required_ext_resources) determined they're unreachable from the
+	// root= filter this load exists to satisfy. Populated by
+	// PackedScene::load_root_scoped() before open()+load().
+	HashSet<String> skip_ext_resource_ids;
+
 	static Error _parse_sub_resources(void *p_self, VariantParser::Stream *p_stream, Ref<Resource> &r_res, int &line, String &r_err_str) { return reinterpret_cast<ResourceLoaderText *>(p_self)->_parse_sub_resource(p_stream, r_res, line, r_err_str); }
 	static Error _parse_ext_resources(void *p_self, VariantParser::Stream *p_stream, Ref<Resource> &r_res, int &line, String &r_err_str) { return reinterpret_cast<ResourceLoaderText *>(p_self)->_parse_ext_resource(p_stream, r_res, line, r_err_str); }
 
@@ -106,6 +115,13 @@ private:
 		HashMap<String, Ref<Resource>> rev_external_resources;
 		HashMap<Ref<Resource>, int> resource_index_map;
 		HashMap<String, Ref<Resource>> resource_map;
+		// Populated regardless of no_placeholders: every ext_resource/sub_resource
+		// id encountered while parsing the current tag's fields/properties. Used
+		// by scan_required_ext_resources() to learn which ids a node or
+		// sub_resource references without loading anything. Callers that don't
+		// care (get_classes_used(), rename_dependencies()) simply never read it.
+		HashSet<String> touched_ext_ids;
+		HashSet<String> touched_sub_ids;
 	};
 
 	static Error _parse_sub_resource_dummys(void *p_self, VariantParser::Stream *p_stream, Ref<Resource> &r_res, int &line, String &r_err_str) { return _parse_sub_resource_dummy(static_cast<DummyReadData *>(p_self), p_stream, r_res, line, r_err_str); }
@@ -114,6 +130,11 @@ private:
 	static Error _parse_sub_resource_dummy(DummyReadData *p_data, VariantParser::Stream *p_stream, Ref<Resource> &r_res, int &line, String &r_err_str);
 	static Error _parse_ext_resource_dummy(DummyReadData *p_data, VariantParser::Stream *p_stream, Ref<Resource> &r_res, int &line, String &r_err_str);
 	String _get_error_string();
+
+	// Structural, resource-free scan (mirrors get_classes_used()'s approach)
+	// used to prune loading to only what a root= reference actually needs.
+	// See PackedScene::load_root_scoped().
+	Error scan_required_ext_resources(const NodePath &p_root_filter, HashSet<String> &r_all_ext_ids, HashSet<String> &r_required_ext_ids);
 
 	VariantParser::ResourceParser rp;
 
