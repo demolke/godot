@@ -2366,7 +2366,169 @@ Vector<Ref<Resource>> SceneState::get_sub_resources() {
 	return sub_resources;
 }
 
-//add
+// Normalizes a node path to a comparable form. `get_node_path()` returns "." for
+// the root and "./A/B" for descendants, whereas references are authored as "A/B".
+// This strips the leading "./" while keeping "." for the root node.
+static String _scene_state_node_path_key(const NodePath &p_path) {
+	String s = String(p_path);
+	if (s.begins_with("./")) {
+		return s.substr(2);
+	}
+	return s;
+}
+
+Ref<SceneState> SceneState::get_subtree_state(const NodePath &p_root) const {
+	Ref<SceneState> ss;
+	ss.instantiate();
+
+	const String root_key = _scene_state_node_path_key(p_root);
+
+	// Inherited scenes store their base nodes as TYPE_INSTANTIATED diffs that only
+	// reconstruct against the base scene. Dropping base_scene_idx (as a re-rooted
+	// plain scene must) would leave those nodes unrecoverable, so refuse up front.
+	ERR_FAIL_COND_V_MSG(
+			base_scene_idx >= 0,
+			Ref<SceneState>(),
+			"get_subtree_state: cannot extract a sub-tree from an inherited scene.");
+
+	// Locate the requested node; it becomes the new root.
+	int target = -1;
+	for (int i = 0; i < nodes.size(); i++) {
+		if (_scene_state_node_path_key(get_node_path(i)) == root_key) {
+			target = i;
+			break;
+		}
+	}
+	ERR_FAIL_COND_V_MSG(target < 0, Ref<SceneState>(), vformat("get_subtree_state: node '%s' not found in scene.", root_key));
+
+	// TYPE_INSTANTIATED nodes are override-only entries produced by a parent
+	// scene instance. They have no class or instance of their own, so they
+	// cannot stand alone as a scene root.
+	ERR_FAIL_COND_V_MSG(
+			nodes[target].type == TYPE_INSTANTIATED,
+			Ref<SceneState>(),
+			vformat("get_subtree_state: node '%s' is an override-only node of a nested instance and cannot be used as a sub-tree root.", root_key));
+
+	// Collect the node and all its descendants (every sibling of an included
+	// node is included too, since we keep whole sub-trees).
+	const String prefix = root_key + "/";
+	HashMap<String, int> path_to_new; // normalized source path -> new index
+	Vector<int> included; // new index -> source index
+	for (int i = 0; i < nodes.size(); i++) {
+		const String key = _scene_state_node_path_key(get_node_path(i));
+		if (key == root_key || key.begins_with(prefix)) {
+			path_to_new[key] = included.size();
+			included.push_back(i);
+		}
+	}
+
+	// The name/variant/node-path tables are referenced by index from NodeData,
+	// so copy them wholesale and leave those indices untouched. Only the node,
+	// parent/owner and connection references need remapping.
+	ss->names = names;
+	ss->variants = variants;
+	ss->node_paths = node_paths;
+	ss->id_paths = id_paths;
+	ss->base_scene_idx = -1; // A sub-tree is a plain scene, not an inherited one.
+
+	// Resolves a parent/owner/connection reference (index or path encoded) to a
+	// normalized source path so it can be looked up in the new index map.
+	auto resolve_ref_path = [&](int p_ref) -> String {
+		if (p_ref < 0 || p_ref == NO_PARENT_SAVED) {
+			return String();
+		}
+		if (p_ref & FLAG_ID_IS_PATH) {
+			return _scene_state_node_path_key(node_paths[p_ref & FLAG_MASK]);
+		}
+		return _scene_state_node_path_key(get_node_path(p_ref & FLAG_MASK));
+	};
+
+	for (int ni = 0; ni < included.size(); ni++) {
+		const int oi = included[ni];
+		NodeData nd = nodes[oi]; // Copies properties and groups (their indices stay valid).
+
+		if (ni == 0) {
+			nd.parent = -1;
+			nd.owner = -1;
+			nd.index = -1;
+		} else {
+			HashMap<String, int>::Iterator P = path_to_new.find(resolve_ref_path(nodes[oi].parent));
+			ERR_CONTINUE_MSG(!P, vformat("get_subtree_state: parent of '%s' falls outside the sub-tree.", _scene_state_node_path_key(get_node_path(oi))));
+			nd.parent = P->value;
+
+			// Ownership stays inside the sub-tree; otherwise the new root owns it.
+			HashMap<String, int>::Iterator O = path_to_new.find(resolve_ref_path(nodes[oi].owner));
+			nd.owner = O ? O->value : 0;
+		}
+
+		ss->nodes.push_back(nd);
+		ss->ids.push_back(oi < ids.size() ? ids[oi] : (int32_t)Node::UNIQUE_SCENE_ID_UNASSIGNED);
+	}
+
+	// Keep only connections whose endpoints are both inside the sub-tree.
+	for (const ConnectionData &c : connections) {
+		HashMap<String, int>::Iterator F = path_to_new.find(resolve_ref_path(c.from));
+		HashMap<String, int>::Iterator T = path_to_new.find(resolve_ref_path(c.to));
+		if (!F || !T) {
+			continue;
+		}
+		ConnectionData nc = c;
+		nc.from = F->value;
+		nc.to = T->value;
+		ss->connections.push_back(nc);
+	}
+
+	// Editable instances under the new root, rebased to it.
+	// Also include the root itself when it was marked editable in the source scene.
+	for (const NodePath &ei : editable_instances) {
+		const String k = _scene_state_node_path_key(ei);
+		if (k == root_key) {
+			ss->editable_instances.push_back(NodePath("."));
+		} else if (k.begins_with(prefix)) {
+			ss->editable_instances.push_back(NodePath(k.substr(prefix.length())));
+		}
+	}
+
+	// Warn about NodePath properties that may reference nodes outside the
+	// extracted sub-tree. Two categories are checked:
+	//   1. Deferred node references (FLAG_PATH_PROPERTY_IS_NODE) — stored as a
+	//      NodePath, resolved to an Object* at instantiation time.
+	//   2. Plain NodePath-typed properties (e.g. AnimationMixer.root_node,
+	//      AnimationTree.anim_player) — stored as Variant::NODE_PATH and
+	//      interpreted at runtime by the node itself.
+	// Both will silently fail to resolve if the path escapes the sub-tree.
+	//
+	// NOTE: Resource properties inside variants (e.g. Animation objects) are
+	// shared by reference between the original scene and the extracted sub-tree.
+	// This is intentional — the sub-tree is a linked view of the source, so
+	// animation edits in the source propagate to instances. Callers that need
+	// fully independent resources must deep-copy after extraction.
+	for (int ni = 0; ni < included.size(); ni++) {
+		const int oi = included[ni];
+		for (const NodeData::Property &prop : nodes[oi].properties) {
+			if (prop.value < 0 || prop.value >= (int)variants.size()) {
+				continue;
+			}
+			String ref_str;
+			if (prop.name & FLAG_PATH_PROPERTY_IS_NODE) {
+				ref_str = String(NodePath(variants[prop.value]));
+			} else if (variants[prop.value].get_type() == Variant::NODE_PATH) {
+				ref_str = String(NodePath(variants[prop.value]));
+			} else {
+				continue;
+			}
+			// Paths that ascend (via ..) or are absolute (/root/...) may land
+			// outside the sub-tree and will not resolve correctly at runtime.
+			if (ref_str.contains("..") || ref_str.begins_with("/")) {
+				const StringName prop_name = names[prop.name & FLAG_PROP_NAME_MASK];
+				WARN_PRINT(vformat("get_subtree_state: node '%s' has NodePath property '%s' = '%s' that may reference a node outside the extracted sub-tree and will not resolve correctly.",
+						_scene_state_node_path_key(get_node_path(oi)), prop_name, ref_str));
+			}
+		}
+	}
+
+	return ss;
+}
 
 int SceneState::add_name(const StringName &p_name) {
 	names.push_back(p_name);
@@ -2667,6 +2829,34 @@ HashSet<StringName> PackedScene::get_scene_groups(const String &p_path) {
 
 Ref<SceneState> PackedScene::get_state() const {
 	return state;
+}
+
+Ref<PackedScene> PackedScene::from_root(const Ref<PackedScene> &p_source, const NodePath &p_root_path) {
+	ERR_FAIL_COND_V(p_source.is_null() || p_source->get_state().is_null(), Ref<PackedScene>());
+
+	Ref<SceneState> sub = p_source->get_state()->get_subtree_state(p_root_path);
+	ERR_FAIL_COND_V(sub.is_null() || !sub->can_instantiate(), Ref<PackedScene>());
+
+	// No synthetic path, no ResourceCache lookup: the wrapper is cheap to
+	// rebuild (array slicing over an already-loaded state, no I/O) and it is
+	// never independently reloaded from disk, so there is nothing to key a
+	// cache entry on. The caller (the ext_resource `root=` reference that
+	// asked for it) is responsible for holding onto the result if it wants
+	// to reuse it.
+	Ref<PackedScene> wrapper;
+	wrapper.instantiate();
+	wrapper->replace_state(sub);
+	wrapper->root_source_path = p_source->get_path();
+	wrapper->root_node_path = p_root_path;
+
+	// Resource::is_built_in() treats an empty path as "internal", which would
+	// make the saver inline this wrapper as a [sub_resource] instead of an
+	// [ext_resource root=...]. Tag it with the source scene's own path so it
+	// is correctly recognized as external — via set_path_cache(), not
+	// set_path(), so it is *not* registered in ResourceCache under that path
+	// (which is already occupied by the real, full source scene resource).
+	wrapper->set_path_cache(p_source->get_path());
+	return wrapper;
 }
 
 void PackedScene::set_path(const String &p_path, bool p_take_over) {

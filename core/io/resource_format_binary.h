@@ -60,6 +60,7 @@ class ResourceLoaderBinary {
 		String path;
 		String type;
 		ResourceUID::ID uid = ResourceUID::INVALID_ID;
+		String root; // Root node path ("A/B") scoping this to a sub-tree; empty for normal refs.
 		Ref<ResourceLoader::LoadToken> load_token;
 	};
 

@@ -144,6 +144,7 @@ Error ResourceLoaderText::_parse_ext_resource(VariantParser::Stream *p_stream, R
 
 		String path = ext_resources[id].path;
 		String type = ext_resources[id].type;
+		const String &root = ext_resources[id].root;
 		Ref<ResourceLoader::LoadToken> &load_token = ext_resources[id].load_token;
 
 		if (load_token.is_valid()) { // If not valid, it's OK since then we know this load accepts broken dependencies.
@@ -158,6 +159,26 @@ Error ResourceLoaderText::_parse_ext_resource(VariantParser::Stream *p_stream, R
 					} else {
 						ResourceLoader::notify_dependency_error(local_path, path, type);
 					}
+				}
+			} else if (!root.is_empty()) {
+				// root= scopes the reference to the sub-tree of another scene,
+				// rooted at that node path, instead of the whole scene.
+				// Only PackedScene is supported for now.
+				Ref<PackedScene> scene = res;
+				if (!scene.is_valid() || !scene->get_state().is_valid()) {
+					error_text = "[ext_resource] root= reference requires a PackedScene at: " + path;
+				} else {
+					r_res = PackedScene::from_root(scene, NodePath(root));
+					if (r_res.is_null()) {
+						error_text = vformat("[ext_resource] could not extract root '%s' from '%s'", root, path);
+					}
+				}
+				if (r_res.is_null() && ResourceLoader::get_abort_on_missing_resources()) {
+					error = ERR_FILE_MISSING_DEPENDENCIES;
+					ERR_PRINT(_get_error_string());
+					err = error;
+				} else if (r_res.is_null()) {
+					ResourceLoader::notify_dependency_error(local_path, path, type);
 				}
 			} else {
 				r_res = res;
@@ -504,7 +525,13 @@ Error ResourceLoaderText::load() {
 
 		ext_resources[id].path = path;
 		ext_resources[id].type = type;
-		ext_resources[id].load_token = ResourceLoader::_load_start(path, type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
+		if (next_tag.fields.has("root")) {
+			ext_resources[id].root = next_tag.fields["root"];
+		}
+		// A root= reference loads the whole scene at `path`, then extracts the
+		// sub-tree rooted at that node path. PackedScene is forced as the load type.
+		const String load_type = ext_resources[id].root.is_empty() ? type : String("PackedScene");
+		ext_resources[id].load_token = ResourceLoader::_load_start(path, load_type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
 		if (ext_resources[id].load_token.is_null()) {
 			if (ResourceLoader::get_abort_on_missing_resources()) {
 				error = ERR_FILE_CORRUPT;
@@ -1072,7 +1099,11 @@ Error ResourceLoaderText::rename_dependencies(Ref<FileAccess> p_f, const String 
 			if (uid != ResourceUID::INVALID_ID) {
 				s += " uid=\"" + ResourceUID::get_singleton()->id_to_text(uid) + "\"";
 			}
-			s += " path=\"" + path + "\" id=\"" + id + "\"]";
+			s += " path=\"" + path + "\"";
+			if (next_tag.fields.has("root")) {
+				s += " root=\"" + String(next_tag.fields["root"]) + "\"";
+			}
+			s += " id=\"" + id + "\"]";
 			fw->store_line(s); // Bundled.
 
 			tag_end = f->get_position();
@@ -1988,15 +2019,27 @@ Error ResourceFormatSaverTextInstance::save(const String &p_path, const Ref<Reso
 	sorted_er.sort();
 
 	for (int i = 0; i < sorted_er.size(); i++) {
-		String p = sorted_er[i].resource->get_path();
+		Ref<PackedScene> as_packed_scene = sorted_er[i].resource;
+		const bool is_root_ref = as_packed_scene.is_valid() && as_packed_scene->is_root_reference();
 
-		String s = "[ext_resource type=\"" + sorted_er[i].resource->get_save_class() + "\"";
+		// A root reference has no path of its own (see PackedScene::from_root);
+		// recover the source scene path and root node path directly instead.
+		String p = is_root_ref ? as_packed_scene->get_root_source_path() : sorted_er[i].resource->get_path();
+		String root = is_root_ref ? String(as_packed_scene->get_root_node_path()) : String();
+
+		// A root reference is always saved as a PackedScene.
+		const String save_class = is_root_ref ? String("PackedScene") : sorted_er[i].resource->get_save_class();
+		String s = "[ext_resource type=\"" + save_class + "\"";
 
 		ResourceUID::ID uid = ResourceSaver::get_resource_id_for_path(p, false);
 		if (uid != ResourceUID::INVALID_ID) {
 			s += " uid=\"" + ResourceUID::get_singleton()->id_to_text(uid) + "\"";
 		}
-		s += " path=\"" + p + "\" id=\"" + sorted_er[i].id + "\"]\n";
+		s += " path=\"" + p + "\"";
+		if (!root.is_empty()) {
+			s += " root=\"" + root + "\"";
+		}
+		s += " id=\"" + sorted_er[i].id + "\"]\n";
 		f->store_string(s); // Bundled.
 	}
 

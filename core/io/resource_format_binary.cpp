@@ -96,9 +96,11 @@ enum {
 	// Version 4: New string ID for ext/subresources, breaks forward compat.
 	// Version 5: Ability to store script class in the header.
 	// Version 6: Added PackedVector4Array Variant type.
-	FORMAT_VERSION = 6,
+	// Version 7: Added per-ext-resource root node path for sub-tree references.
+	FORMAT_VERSION = 7,
 	FORMAT_VERSION_CAN_RENAME_DEPS = 1,
 	FORMAT_VERSION_NO_NODEPATH_PROPERTY = 3,
+	FORMAT_VERSION_EXT_RESOURCE_ROOT = 7,
 };
 
 void ResourceLoaderBinary::_advance_padding(uint32_t p_len) {
@@ -435,6 +437,7 @@ Error ResourceLoaderBinary::parse_variant(Variant &r_v) {
 						if (load_token.is_valid()) { // If not valid, it's OK since then we know this load accepts broken dependencies.
 							Error err;
 							Ref<Resource> res = ResourceLoader::_load_complete(*load_token.ptr(), &err);
+							const String &root = external_resources[erindex].root;
 							if (res.is_null()) {
 								if (!ResourceLoader::is_cleaning_tasks()) {
 									if (!ResourceLoader::get_abort_on_missing_resources()) {
@@ -443,6 +446,25 @@ Error ResourceLoaderBinary::parse_variant(Variant &r_v) {
 										error = ERR_FILE_MISSING_DEPENDENCIES;
 										ERR_FAIL_V_MSG(error, vformat("Can't load dependency: '%s'.", external_resources[erindex].path));
 									}
+								}
+							} else if (!root.is_empty()) {
+								// root= scopes the reference to the sub-tree of another
+								// scene, rooted at that node path. Only PackedScene is
+								// supported for now.
+								Ref<PackedScene> scene = res;
+								Ref<Resource> sub;
+								if (scene.is_valid() && scene->get_state().is_valid()) {
+									sub = PackedScene::from_root(scene, NodePath(root));
+								}
+								if (sub.is_null()) {
+									if (ResourceLoader::get_abort_on_missing_resources()) {
+										error = ERR_FILE_MISSING_DEPENDENCIES;
+										ERR_FAIL_V_MSG(error, vformat("[ext_resource] could not extract root '%s' from '%s'.", root, external_resources[erindex].path));
+									} else {
+										ResourceLoader::notify_dependency_error(local_path, external_resources[erindex].path, external_resources[erindex].type);
+									}
+								} else {
+									r_v = sub;
 								}
 							} else {
 								r_v = res;
@@ -636,7 +658,12 @@ Error ResourceLoaderBinary::load() {
 		}
 
 		external_resources.write[i].path = path; //remap happens here, not on load because on load it can actually be used for filesystem dock resource remap
-		external_resources.write[i].load_token = ResourceLoader::_load_start(path, external_resources[i].type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
+
+		// A root= reference loads the whole scene at `path`, then extracts the
+		// sub-tree rooted at that node path (done in parse_variant, once the
+		// load completes). PackedScene is forced as the load type.
+		const String load_type = external_resources[i].root.is_empty() ? external_resources[i].type : String("PackedScene");
+		external_resources.write[i].load_token = ResourceLoader::_load_start(path, load_type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
 		if (external_resources[i].load_token.is_null()) {
 			if (!ResourceLoader::get_abort_on_missing_resources()) {
 				ResourceLoader::notify_dependency_error(local_path, path, external_resources[i].type);
@@ -1030,6 +1057,12 @@ void ResourceLoaderBinary::open(Ref<FileAccess> p_file, bool p_no_resources, boo
 				}
 			}
 		}
+		// Root node path scoping this reference to a sub-tree, applied once the
+		// full scene finishes loading (see the OBJECT_EXTERNAL_RESOURCE_INDEX
+		// case in parse_variant). Older files have no such field.
+		if (ver_format >= FORMAT_VERSION_EXT_RESOURCE_ROOT) {
+			er.root = get_unicode_string();
+		}
 
 		external_resources.push_back(er);
 	}
@@ -1398,12 +1431,23 @@ Error ResourceFormatLoaderBinary::rename_dependencies(const String &p_path, cons
 			path = local_path.path_to_file(path);
 		}
 
+		// Preserve the root node path across the rewrite (the renamed path
+		// above is the bare source; the root path is independent of it).
+		String root;
+		if (ver_format >= FORMAT_VERSION_EXT_RESOURCE_ROOT) {
+			root = get_ustring(f);
+		}
+
 		save_ustring(fw, type);
 		save_ustring(fw, path);
 
 		if (using_uids) {
 			ResourceUID::ID uid = ResourceSaver::get_resource_id_for_path(full_path);
 			fw->store_64(uint64_t(uid));
+		}
+
+		if (ver_format >= FORMAT_VERSION_EXT_RESOURCE_ROOT) {
+			save_ustring(fw, root);
 		}
 	}
 
@@ -2257,12 +2301,20 @@ Error ResourceFormatSaverBinaryInstance::save(const String &p_path, const Ref<Re
 	}
 
 	for (int i = 0; i < save_order.size(); i++) {
-		save_unicode_string(f, save_order[i]->get_save_class());
-		String res_path = save_order[i]->get_path();
-		res_path = relative_paths ? local_path.path_to_file(res_path) : res_path;
+		// A root reference has no path of its own (see PackedScene::from_root);
+		// recover the source scene path and root node path directly instead.
+		Ref<PackedScene> as_packed_scene = save_order[i];
+		const bool is_root_ref = as_packed_scene.is_valid() && as_packed_scene->is_root_reference();
+
+		String src_path = is_root_ref ? as_packed_scene->get_root_source_path() : save_order[i]->get_path();
+		String root = is_root_ref ? String(as_packed_scene->get_root_node_path()) : String();
+
+		save_unicode_string(f, is_root_ref ? String("PackedScene") : save_order[i]->get_save_class());
+		String res_path = relative_paths ? local_path.path_to_file(src_path) : src_path;
 		save_unicode_string(f, res_path);
-		ResourceUID::ID ruid = ResourceSaver::get_resource_id_for_path(save_order[i]->get_path(), false);
+		ResourceUID::ID ruid = ResourceSaver::get_resource_id_for_path(src_path, false);
 		f->store_64(uint64_t(ruid));
+		save_unicode_string(f, root);
 	}
 	// save internal resource table
 	f->store_32(uint32_t(saved_resources.size())); //amount of internal resources

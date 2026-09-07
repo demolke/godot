@@ -214,6 +214,11 @@ public:
 	Ref<Resource> get_sub_resource(const String &p_path);
 	Vector<Ref<Resource>> get_sub_resources();
 
+	// Builds a new, standalone SceneState containing only the sub-tree rooted at
+	// p_root (which becomes the new root). Everything outside the sub-tree is
+	// discarded. Used to reference a node of another scene as a PackedScene.
+	Ref<SceneState> get_subtree_state(const NodePath &p_root) const;
+
 	//build API
 
 	int add_name(const StringName &p_name);
@@ -292,7 +297,27 @@ public:
 #endif
 	Ref<SceneState> get_state() const;
 
+	// Builds a lightweight PackedScene scoped to the sub-tree rooted at
+	// p_root_path of p_source. p_source must already be a loaded PackedScene.
+	// The wrapper holds a re-rooted SceneState; it has no resource path of its
+	// own (there is no synthetic path scheme — root scoping is carried as a
+	// plain field on the ext_resource that references it, see
+	// ResourceLoaderText::ExtResource::root and ExternalResource::root in
+	// resource_format_binary.h). get_root_source_path()/get_root_node_path()
+	// let the savers recover what to write back out for such a wrapper.
+	static Ref<PackedScene> from_root(const Ref<PackedScene> &p_source, const NodePath &p_root_path);
+
+	// True if this PackedScene was produced by from_root() and therefore
+	// represents a scoped sub-tree of another scene, not a full scene of its own.
+	bool is_root_reference() const { return !root_source_path.is_empty(); }
+	String get_root_source_path() const { return root_source_path; }
+	NodePath get_root_node_path() const { return root_node_path; }
+
 	PackedScene();
+
+private:
+	String root_source_path;
+	NodePath root_node_path;
 };
 
 VARIANT_ENUM_CAST(PackedScene::GenEditState)
