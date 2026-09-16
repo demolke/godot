@@ -30,7 +30,13 @@
 
 #pragma once
 
+#include "core/core_globals.h"
 #include "core/error/error_macros.h"
+#include "core/string/ustring.h"
+#include "core/templates/vector.h"
+#include "tests/test_macros.h"
+
+#include <exception>
 
 struct ErrorDetector {
 	ErrorDetector() {
@@ -46,13 +52,66 @@ struct ErrorDetector {
 
 	void clear() {
 		has_error = false;
+		messages.clear();
+	}
+
+	bool has_message_containing(const String &p_text) const {
+		for (const String &msg : messages) {
+			if (msg.contains(p_text)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	static void _detect_error(void *p_self, const char *p_func, const char *p_file, int p_line, const char *p_error, const char *p_errorexp, bool p_editor_notify, ErrorHandlerType p_type) {
 		ErrorDetector *self = (ErrorDetector *)p_self;
 		self->has_error = true;
+		String message;
+		if (p_error != nullptr && p_error[0] != '\0') {
+			message += p_error;
+		}
+		if (p_errorexp != nullptr && p_errorexp[0] != '\0') {
+			if (!message.is_empty()) {
+				message += "\n";
+			}
+			message += p_errorexp;
+		}
+		self->messages.push_back(message);
 	}
 
 	ErrorHandlerList eh;
 	bool has_error = false;
+	Vector<String> messages;
+};
+
+// Scoped expectation for engine errors.
+struct ExpectErrors : ErrorDetector {
+	ExpectErrors(const Vector<String> &p_expected_messages) :
+			expected(p_expected_messages) {
+		was_print_enabled = CoreGlobals::print_error_enabled;
+		CoreGlobals::print_error_enabled = false;
+	}
+
+	ExpectErrors(const String &p_expected_message) {
+		expected.push_back(p_expected_message);
+		was_print_enabled = CoreGlobals::print_error_enabled;
+		CoreGlobals::print_error_enabled = false;
+	}
+
+	~ExpectErrors() {
+		CoreGlobals::print_error_enabled = was_print_enabled;
+		if (std::uncaught_exceptions() == 0) {
+			CHECK(has_error);
+			for (const String &text : expected) {
+				CHECK_MESSAGE(has_message_containing(text), "An expected engine error was not emitted.");
+			}
+		}
+	}
+
+	ExpectErrors(const ExpectErrors &) = delete;
+	ExpectErrors &operator=(const ExpectErrors &) = delete;
+
+	Vector<String> expected;
+	bool was_print_enabled = true;
 };

@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/io/resource.h"
+#include "core/io/resource_loader.h"
 #include "scene/main/node.h"
 
 class PackedScene;
@@ -214,6 +215,9 @@ public:
 	Ref<Resource> get_sub_resource(const String &p_path);
 	Vector<Ref<Resource>> get_sub_resources();
 
+	// Builds a new, standalone SceneState containing only the sub-tree 
+	Ref<SceneState> get_subtree_state(const NodePath &p_subroot) const;
+
 	//build API
 
 	int add_name(const StringName &p_name);
@@ -292,7 +296,29 @@ public:
 #endif
 	Ref<SceneState> get_state() const;
 
+	static Ref<PackedScene> create_sub_reference(const Ref<PackedScene> &p_source, const NodePath &p_node, const String &p_path, ResourceFormatLoader::CacheMode p_cache_mode = ResourceFormatLoader::CACHE_MODE_REUSE);
+
+	static Ref<PackedScene> from_subroot(const Ref<PackedScene> &p_source, const NodePath &p_subroot);
+
+	Node *instantiate_root(const NodePath &p_subroot, GenEditState p_edit_state = GEN_EDIT_STATE_DISABLED) const;
+
 	PackedScene();
 };
 
 VARIANT_ENUM_CAST(PackedScene::GenEditState)
+
+// Resolves synthetic "res://src.tscn@subroot=A/B" paths to a PackedScene
+class ResourceFormatLoaderSubScene : public ResourceFormatLoader {
+public:
+	static const char *SUB_SCENE_SEPARATOR;
+
+	static String make_sub_path(const String &p_scene_path, const String &p_node_path);
+
+	static void split_sub_path(const String &p_path, String &r_scene_path, String &r_node_path);
+
+	virtual Ref<Resource> load(const String &p_path, const String &p_original_path = "", Error *r_error = nullptr, bool p_use_sub_threads = false, float *r_progress = nullptr, CacheMode p_cache_mode = CACHE_MODE_REUSE) override;
+	virtual bool recognize_path(const String &p_path, const String &p_for_type = String()) const override;
+	virtual bool handles_type(const String &p_type) const override;
+	virtual String get_resource_type(const String &p_path) const override;
+	virtual void get_dependencies(const String &p_path, List<String> *p_dependencies, bool p_add_types = false) override;
+};

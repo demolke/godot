@@ -96,9 +96,11 @@ enum {
 	// Version 4: New string ID for ext/subresources, breaks forward compat.
 	// Version 5: Ability to store script class in the header.
 	// Version 6: Added PackedVector4Array Variant type.
-	FORMAT_VERSION = 6,
+	// Version 7: Added subroot node path for ext resources.
+	FORMAT_VERSION = 7,
 	FORMAT_VERSION_CAN_RENAME_DEPS = 1,
 	FORMAT_VERSION_NO_NODEPATH_PROPERTY = 3,
+	FORMAT_VERSION_EXT_RESOURCE_SUBROOT = 7,
 };
 
 void ResourceLoaderBinary::_advance_padding(uint32_t p_len) {
@@ -635,6 +637,12 @@ Error ResourceLoaderBinary::load() {
 			path = ProjectSettings::get_singleton()->localize_path(path.get_base_dir().path_join(external_resources[i].path));
 		}
 
+		// Reattach a sub-tree subroot locator now that the source path is fully
+		// resolved, yielding the synthetic path the SubScene loader expects.
+		if (!external_resources[i].subroot.is_empty()) {
+			path = ResourceFormatLoaderSubScene::make_sub_path(path, external_resources[i].subroot);
+		}
+
 		external_resources.write[i].path = path; //remap happens here, not on load because on load it can actually be used for filesystem dock resource remap
 		external_resources.write[i].load_token = ResourceLoader::_load_start(path, external_resources[i].type, use_sub_threads ? ResourceLoader::LOAD_THREAD_DISTRIBUTE : ResourceLoader::LOAD_THREAD_FROM_CURRENT, cache_mode_for_external);
 		if (external_resources[i].load_token.is_null()) {
@@ -1037,6 +1045,10 @@ void ResourceLoaderBinary::open(Ref<FileAccess> p_file, bool p_no_resources, boo
 				}
 			}
 		}
+		// Subroot locator, reattached after path resolution. Older files have no field.
+		if (ver_format >= FORMAT_VERSION_EXT_RESOURCE_SUBROOT) {
+			er.subroot = get_unicode_string();
+		}
 
 		external_resources.push_back(er);
 	}
@@ -1405,12 +1417,21 @@ Error ResourceFormatLoaderBinary::rename_dependencies(const String &p_path, cons
 			path = local_path.path_to_file(path);
 		}
 
+		String subroot;
+		if (ver_format >= FORMAT_VERSION_EXT_RESOURCE_SUBROOT) {
+			subroot = get_ustring(f);
+		}
+
 		save_ustring(fw, type);
 		save_ustring(fw, path);
 
 		if (using_uids) {
 			ResourceUID::ID uid = ResourceSaver::get_resource_id_for_path(full_path);
 			fw->store_64(uint64_t(uid));
+		}
+
+		if (ver_format >= FORMAT_VERSION_EXT_RESOURCE_SUBROOT) {
+			save_ustring(fw, subroot);
 		}
 	}
 
@@ -2264,13 +2285,18 @@ Error ResourceFormatSaverBinaryInstance::save(const String &p_path, const Ref<Re
 	}
 
 	for (int i = 0; i < save_order.size(); i++) {
-		save_unicode_string(f, save_order[i]->get_save_class());
-		String res_path = save_order[i]->get_path();
-		res_path = relative_paths ? local_path.path_to_file(res_path) : res_path;
+		// If the external reference refers to subtree, split it.
+		String src_path, subroot;
+		ResourceFormatLoaderSubScene::split_sub_path(save_order[i]->get_path(), src_path, subroot);
+
+		save_unicode_string(f, subroot.is_empty() ? save_order[i]->get_save_class() : String("PackedScene"));
+		String res_path = relative_paths ? local_path.path_to_file(src_path) : src_path;
 		save_unicode_string(f, res_path);
-		ResourceUID::ID ruid = ResourceSaver::get_resource_id_for_path(save_order[i]->get_path(), false);
+		ResourceUID::ID ruid = ResourceSaver::get_resource_id_for_path(src_path, false);
 		f->store_64(uint64_t(ruid));
+		save_unicode_string(f, subroot);
 	}
+
 	// save internal resource table
 	f->store_32(uint32_t(saved_resources.size())); //amount of internal resources
 	Vector<uint64_t> ofs_pos;
