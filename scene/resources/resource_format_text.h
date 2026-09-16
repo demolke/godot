@@ -62,6 +62,7 @@ private:
 		Ref<ResourceLoader::LoadToken> load_token;
 		String path;
 		String type;
+		String subroot;
 	};
 
 	bool is_scene = false;
