@@ -542,6 +542,12 @@ void OccluderInstance3D::_bake_surface(const Transform3D &p_transform, Array p_s
 	}
 
 	if (!Math::is_zero_approx(p_simplification_dist) && SurfaceTool::simplify_func) {
+		// Weld vertices by position
+		SurfaceTool::strip_mesh_arrays(vertices, indices);
+		if (indices.is_empty()) {
+			return;
+		}
+
 		Vector<float> vertices_f32 = vector3_to_float32_array(vertices.ptr(), vertices.size());
 
 		float error_scale = SurfaceTool::simplify_scale_func(vertices_f32.ptr(), vertices.size(), sizeof(float) * 3);
